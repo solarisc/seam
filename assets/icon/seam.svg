@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Seam: two screens side by side, with the pointer crossing between them. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B8DF2"/>
+      <stop offset="1" stop-color="#2F55CC"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#tile)"/>
+  <g fill="#FFFFFF">
+    <rect x="30" y="80" width="90" height="62" rx="10"/>
+    <path d="M70 142 h10 v16 h14 a4 4 0 0 1 0 8 h-38 a4 4 0 0 1 0 -8 h14 z"/>
+  </g>
+  <g fill="#FFFFFF" fill-opacity="0.55">
+    <rect x="136" y="80" width="90" height="62" rx="10"/>
+    <path d="M176 142 h10 v16 h14 a4 4 0 0 1 0 8 h-38 a4 4 0 0 1 0 -8 h14 z"/>
+  </g>
+  <path d="M121 92 V136 L131 127 L138 143 L147 139 L140 123 H154 Z"
+        fill="#10204A" stroke="#FFFFFF" stroke-width="6" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,11 @@
+Copyright (c) The Seam contributors
+
+Seam is licensed under either of
+
+  * the Apache License, Version 2.0 (LICENSE-APACHE.txt), or
+  * the MIT license (LICENSE-MIT.txt)
+
+at your option. The full text of both is installed in Seam's folder.
+
+The Inter font included in Seam is licensed under the SIL Open Font
+License, Version 1.1 (Inter-LICENSE.txt).

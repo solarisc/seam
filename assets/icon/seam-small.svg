@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- The 16 to 32 pixel icon: the two screens alone stay sharp that small. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B8DF2"/>
+      <stop offset="1" stop-color="#2F55CC"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="256" height="256" rx="56" fill="url(#tile)"/>
+  <g fill="#FFFFFF">
+    <rect x="20" y="64" width="102" height="80" rx="14"/>
+    <rect x="50" y="160" width="42" height="18" rx="6"/>
+  </g>
+  <g fill="#FFFFFF" fill-opacity="0.55">
+    <rect x="134" y="64" width="102" height="80" rx="14"/>
+    <rect x="164" y="160" width="42" height="18" rx="6"/>
+  </g>
+</svg>

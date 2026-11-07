@@ -1,0 +1,66 @@
+name: Bug report
+description: Something in Seam does not work as it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Security problems go through a
+        [private advisory](https://github.com/solarisc/seam/security/advisories/new) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, step by step, and what you saw (messages in the Seam window, screenshots).
+      placeholder: |
+        1. Move the pointer from the Windows PC onto the Mac
+        2. Press Command+C on the Mac
+        3. The pointer jumps back to …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Seam version
+      description: Shown under **Settings**, or printed by `seam-agent --version`.
+      placeholder: seam-agent 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How Seam was installed
+      options:
+        - Windows setup program from a release
+        - Built from source on macOS
+        - Built from source on Windows
+    validations:
+      required: true
+  - type: textarea
+    id: computers
+    attributes:
+      label: Computers
+      description: Each computer's operating system and version, which one has the keyboard and mouse, and how they connect (cable or Wi-Fi).
+      placeholder: |
+        Windows 11 24H2 desktop (keyboard and mouse plugged in here), cable
+        macOS 15.5 MacBook Air, Wi-Fi
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Connection state
+      description: The output of `seam-agent status` on the computer with the keyboard and mouse.
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant lines of `agent.log` from both computers (**Settings → Open log folder**).
+      render: text

@@ -1,0 +1,11 @@
+[package]
+name = "seam-icons"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Renders Seam's icon from assets/icon/*.svg into .png, .ico and .icns"
+
+[dependencies]
+icns = "0.3"
+ico = "0.4"
+resvg = "0.45"
