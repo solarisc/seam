@@ -2,9 +2,10 @@
 //! lean the playback rate so the two computers' audio clocks stay in step.
 //!
 //! Sound arrives in the sender's buffers and leaves in the speakers', about
-//! 10 ms each. As the two clocks drift, the speakers now and then find no new
-//! packet, so the buffer at a typical low point must hold a packet in reserve
-//! plus a margin, and at its very lowest still the margin. Short of either,
+//! 10 ms each. When packets arrive close to the moment the speakers take sound,
+//! or when that moment isn't known, one arriving late now and then misses it,
+//! so the buffer at a typical low point must then hold a packet in reserve plus
+//! a margin. At its very lowest it must still hold the margin. Short of either,
 //! the target grows at once; with room to spare, and the buffer settled, it
 //! shrinks a step. Each time the buffer runs dry the margin widens, so a
 //! network that is unsteady settles on a delay that suits it.
@@ -85,6 +86,8 @@ pub(super) struct Pacing {
     window: usize,
     /// Looks since the buffer last ran dry.
     calm: u32,
+    /// A packet is held in reserve (see the module's notes).
+    reserve: bool,
     pub(super) underruns: u64,
 }
 
@@ -105,6 +108,7 @@ impl Pacing {
             largest_packet: 0,
             window: 0,
             calm: 0,
+            reserve: true,
             underruns: 0,
         };
         pacing.target = pacing.frames_in(START_DELAY);
@@ -144,6 +148,20 @@ impl Pacing {
             self.low_points[self.low_count] = fill.min(u32::MAX as usize) as u32;
             self.low_count += 1;
         }
+    }
+
+    /// Hold a packet in reserve, or not. Holding starts at once.
+    #[cfg(any(windows, test))]
+    pub(super) fn hold_reserve(&mut self, hold: bool) {
+        if hold && !self.reserve {
+            self.target = self
+                .target
+                .max(self.largest_packet + self.margin)
+                .min(self.frames_in(MAX_DELAY));
+            self.lows = [0; LOOKS_REMEMBERED];
+            self.typicals = [0; LOOKS_REMEMBERED];
+        }
+        self.reserve = hold;
     }
 
     pub(super) fn ran_dry(&mut self) {
@@ -188,7 +206,8 @@ impl Pacing {
         } else {
             lowest
         };
-        let (margin, reserve) = (self.margin, self.largest_packet + self.margin);
+        let packet = if self.reserve { self.largest_packet } else { 0 };
+        let (margin, reserve) = (self.margin, packet + self.margin);
         // Shorten only on what the last several looks all allow: a dip that
         // comes now and then must not be forgotten between two looks.
         self.lows.rotate_right(1);

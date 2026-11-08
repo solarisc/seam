@@ -136,8 +136,17 @@ last 10 seconds: that a typical low point (the tenth percentile) still held a
 packet plus a margin, and that the lowest held the margin. Short of either,
 the target grows at once; with room to spare, and the buffer settled, it
 shrinks by up to 2 ms. The margin starts at 4 ms and widens by 3 ms each time
-the buffer runs dry. On a steady wired network between two Windows
-computers, sound plays here about 20 ms after it plays there.
+the buffer runs dry.
+
+A packet is held in reserve only because one that arrives just before the
+speakers take sound misses that take when it comes a little late. On
+Windows the speakers' clock tells when they next take sound, so each packet's
+time to spare is known: the reserve is held as soon as a packet comes within
+2 ms of a take, and let go once every packet for 30 seconds has kept more
+than 3 ms clear, which saves one speaker period (usually 10 ms). The two
+clocks drift, so this changes over minutes. On a steady wired network between
+two Windows computers, sound plays here about 15 to 30 ms after it plays
+there, depending on where packets fall between the speakers' takes.
 
 After 2 seconds with nothing to play, the speakers pause, which costs
 nothing, and resume when sound arrives; after 10 minutes paused they close.

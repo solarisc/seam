@@ -33,6 +33,54 @@ pub(super) trait Speaker {
     fn running(&self) -> bool;
     fn start(&mut self) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
+    /// Frames until the speakers next take sound from the buffer, and the
+    /// frames between takes; none while that isn't known.
+    fn next_take(&mut self) -> Option<(usize, usize)> {
+        None
+    }
+}
+
+/// How close packets come to the speakers taking sound. A packet that
+/// arrives just before a take misses it when it comes a little late, so only
+/// then must a packet be held in reserve. Holding starts as soon as a packet
+/// comes within 2 ms of a take, and ends once every packet for 30 s has kept
+/// more than 3 ms clear, so the delay doesn't swing back and forth.
+#[derive(Default)]
+struct Arrivals {
+    /// The least time to spare this look, and in each recent look.
+    closest: Option<usize>,
+    looks: [Option<usize>; 15],
+    seen: usize,
+    clear: bool,
+}
+
+impl Arrivals {
+    /// Packets seen per look: 2 s of 10 ms packets.
+    const PER_LOOK: usize = 200;
+
+    /// A packet arrived `spare` frames before the speakers take sound, at
+    /// `rate`. True while no packet need be held in reserve.
+    fn saw(&mut self, spare: usize, rate: u32) -> bool {
+        let closest = self.closest.map_or(spare, |closest| closest.min(spare));
+        self.closest = Some(closest);
+        self.seen += 1;
+        if self.seen >= Self::PER_LOOK {
+            self.looks.rotate_right(1);
+            self.looks[0] = self.closest.take();
+            self.seen = 0;
+        }
+        let (near, far) = (rate as usize / 500, rate as usize / 333);
+        if self.clear {
+            self.clear = closest >= near;
+        } else {
+            self.clear = closest > far
+                && self
+                    .looks
+                    .iter()
+                    .all(|look| look.is_some_and(|spare| spare > far));
+        }
+        self.clear
+    }
 }
 
 /// One controlled computer's sound, written into the speakers as it arrives.
@@ -40,6 +88,7 @@ pub(super) struct Push<S> {
     speaker: Option<S>,
     open: Box<dyn FnMut() -> Result<S> + Send>,
     pacing: Pacing,
+    arrivals: Arrivals,
     steering: Steering,
     converter: Option<Box<dyn Adjustable<f32>>>,
     /// The sender's and the speakers' rates the converter was made for.
@@ -69,6 +118,7 @@ impl<S: Speaker> Push<S> {
             speaker: None,
             open: Box::new(open),
             pacing: Pacing::new(rate),
+            arrivals: Arrivals::default(),
             steering: Steering::default(),
             converter: None,
             rates: (0, 0),
@@ -211,6 +261,7 @@ impl<S: Speaker> Push<S> {
         } else if padding == 0 {
             // The speakers ran out before this arrived.
             self.pacing.ran_dry();
+            self.arrivals = Arrivals::default();
             self.pacing.target().saturating_sub(buffered)
         } else {
             self.pacing.low_point(buffered);
@@ -236,7 +287,21 @@ impl<S: Speaker> Push<S> {
             self.mapped.resize(silence.min(room) * channels, 0.0);
             speaker.write(&self.mapped)?;
         }
-        self.write_input()
+        self.write_input()?;
+        let output_rate = self.speakers_rate();
+        let clear = match self.speaker.as_mut().and_then(Speaker::next_take) {
+            Some((spare, _)) => self.arrivals.saw(spare, output_rate),
+            None => {
+                self.arrivals = Arrivals::default();
+                false
+            }
+        };
+        self.pacing.hold_reserve(!clear);
+        Ok(())
+    }
+
+    fn speakers_rate(&self) -> u32 {
+        self.speaker.as_ref().map_or(48_000, Speaker::rate)
     }
 
     /// Convert every whole step waiting and write it to the speakers.
@@ -281,6 +346,7 @@ impl<S: Speaker> Push<S> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::time::Duration;
 
     /// A speaker that plays a 10 ms period at a time, as Windows' shared
     /// mode does, and counts the times it found less than a period.
@@ -291,6 +357,11 @@ mod tests {
         /// Sound has been written, so from now on it streams without a gap.
         started: bool,
         short: u32,
+        /// The time in ms, the ms of each 10 at which it takes sound, and
+        /// whether it tells when that is.
+        now: usize,
+        takes_at: usize,
+        tells: bool,
     }
 
     impl Fake {
@@ -338,6 +409,11 @@ mod tests {
             self.lock().unwrap().running = false;
             Ok(())
         }
+        fn next_take(&mut self) -> Option<(usize, usize)> {
+            let fake = self.lock().unwrap();
+            let ms = (fake.takes_at + 10 - fake.now % 10) % 10;
+            fake.tells.then_some((ms * 48, 480))
+        }
     }
 
     type Shared = std::sync::Arc<std::sync::Mutex<Fake>>;
@@ -349,6 +425,9 @@ mod tests {
             running: false,
             started: false,
             short: 0,
+            now: 0,
+            takes_at: 3,
+            tells: false,
         }))
     }
 
@@ -367,14 +446,30 @@ mod tests {
     /// `lateness` ms late, and the speakers playing a period every 10 ms.
     /// Returns the mean frames waiting in the speakers.
     fn run(clock: f64, lateness: usize, seconds: usize) -> (Shared, Push<Shared>, f64) {
-        let device = speaker();
+        run_on(speaker(), clock, lateness, seconds, false)
+    }
+
+    fn run_on(
+        device: Shared,
+        clock: f64,
+        lateness: usize,
+        seconds: usize,
+        steady: bool,
+    ) -> (Shared, Push<Shared>, f64) {
         let opened = device.clone();
         let mut push = Push::new(48_000, move || Ok(opened.clone()));
         let (mut sent, mut random) = (0usize, 0x2468_ace1u32);
         let mut in_flight: VecDeque<(usize, Vec<u8>)> = VecDeque::new();
         let (mut sum, mut count) = (0.0, 0.0);
         for step in 0..seconds * 1000 {
-            let due = ((step + 1) as f64 * 48.0 * clock) as usize;
+            device.lock().unwrap().now = step;
+            let due = if steady {
+                // Whole packets on the sender's clock, as a device records.
+                let packets = ((step + 1) as f64 * clock / 10.0) as usize;
+                packets * 480
+            } else {
+                ((step + 1) as f64 * 48.0 * clock) as usize
+            };
             if due >= sent + 480 {
                 random ^= random << 13;
                 random ^= random >> 17;
@@ -389,7 +484,8 @@ mod tests {
             while in_flight.front().is_some_and(|(at, _)| *at <= step) {
                 push.push(&in_flight.pop_front().unwrap().1);
             }
-            if step % 10 == 3 {
+            let takes_at = device.lock().unwrap().takes_at;
+            if step % 10 == takes_at {
                 device.lock().unwrap().tick();
             }
             if step > seconds * 500 {
@@ -422,6 +518,55 @@ mod tests {
         }
     }
 
+    /// Speakers that tell when they take sound, at `takes_at` ms of each 10.
+    fn telling(takes_at: usize) -> Shared {
+        let device = speaker();
+        {
+            let mut fake = device.lock().unwrap();
+            fake.takes_at = takes_at;
+            fake.tells = true;
+        }
+        device
+    }
+
+    #[test]
+    fn packets_clear_of_the_takes_need_no_packet_in_reserve() {
+        // Packets arrive 4 ms before the speakers take sound.
+        let (device, push, mean) = run_on(telling(3), 1.0, 0, 120, true);
+        assert_eq!(device.lock().unwrap().short, 0);
+        let delay = push.pacing().delay();
+        assert!(delay < Duration::from_millis(8), "{delay:?}");
+        assert!(mean < 12.0, "{mean:.1} ms waiting");
+    }
+
+    #[test]
+    fn packets_close_to_the_takes_keep_a_packet_in_reserve() {
+        // Packets arrive just before the speakers take sound, now and then
+        // 1 ms late.
+        for takes_at in [9, 0] {
+            let (device, push, _) = run_on(telling(takes_at), 1.0, 1, 60, true);
+            assert_eq!(
+                device.lock().unwrap().short,
+                0,
+                "ran short taking at {takes_at}"
+            );
+            assert!(push.pacing().delay() >= Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_reserve_returns_before_drifting_packets_reach_the_takes() {
+        // 100 ppm moves the packets 1 ms against the takes every 10 s, past
+        // them more than once in four minutes, now and then 1 ms late.
+        for clock in [0.9999, 1.0001] {
+            let (device, _, _) = run_on(telling(3), clock, 1, 240, true);
+            assert_eq!(
+                device.lock().unwrap().short,
+                0,
+                "ran short at clock {clock}"
+            );
+        }
+    }
     #[test]
     fn sound_starts_at_the_target_and_plays_out_in_full() {
         let device = speaker();

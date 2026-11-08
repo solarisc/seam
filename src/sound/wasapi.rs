@@ -16,9 +16,9 @@ use std::{
 use windows::Win32::{
     Media::{
         Audio::{
-            AUDCLNT_SHAREMODE_SHARED, IAudioClient, IAudioRenderClient, IMMDevice,
-            IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole,
-            eRender,
+            AUDCLNT_SHAREMODE_SHARED, IAudioClient, IAudioClient3, IAudioClock, IAudioRenderClient,
+            IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+            eConsole, eRender,
         },
         KernelStreaming::WAVE_FORMAT_EXTENSIBLE,
         Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT},
@@ -73,6 +73,17 @@ pub(super) struct Wasapi {
     rate: u32,
     running: bool,
     id: String,
+    /// Where the speakers are playing.
+    clock: IAudioClock,
+    /// Clock units per second.
+    frequency: f64,
+    /// Frames the speakers take at a time.
+    period: usize,
+    /// Where the clock stood when the speakers took sound once: they take it
+    /// again each period after. Learned once they run, for `next_take`.
+    take_at: Option<f64>,
+    /// Times that learning found no take, since the speakers started.
+    missed: u32,
 }
 
 // The interfaces belong to the multithreaded apartment, which every thread
@@ -111,6 +122,9 @@ impl Wasapi {
             let (channels, rate) = opened.context("opening the speakers")?;
             let capacity = client.GetBufferSize()? as usize;
             let render: IAudioRenderClient = client.GetService()?;
+            let clock: IAudioClock = client.GetService()?;
+            let frequency = clock.GetFrequency()? as f64;
+            let period = engine_period(&client, rate);
             client.Start().context("starting the speakers")?;
             log::info!(
                 "sound playing on {} at {rate} Hz, {channels} channel(s), written as it arrives",
@@ -124,6 +138,11 @@ impl Wasapi {
                 rate,
                 running: true,
                 id,
+                clock,
+                frequency: frequency.max(1.0),
+                period,
+                take_at: None,
+                missed: 0,
             })
         }
     }
@@ -187,6 +206,9 @@ impl Speaker for Wasapi {
         enter_com();
         unsafe { self.client.Start()? };
         self.running = true;
+        // Started again, the speakers may take sound at other moments.
+        self.take_at = None;
+        self.missed = 0;
         Ok(())
     }
 
@@ -196,6 +218,70 @@ impl Speaker for Wasapi {
         self.running = false;
         Ok(())
     }
+
+    fn next_take(&mut self) -> Option<(usize, usize)> {
+        if self.take_at.is_none() && self.missed < 3 {
+            self.learn_takes();
+        }
+        let (take_at, period) = (self.take_at?, self.period as f64);
+        let since = (self.played()? - take_at).rem_euclid(period);
+        Some(((period - since) as usize, self.period))
+    }
+}
+
+impl Wasapi {
+    /// Where the speakers' clock stands, in frames played.
+    fn played(&self) -> Option<f64> {
+        let mut position = 0u64;
+        unsafe { self.clock.GetPosition(&mut position, None) }.ok()?;
+        Some(position as f64 / self.frequency * f64::from(self.rate))
+    }
+
+    /// Watch, for up to a period, for the speakers to take sound, and note
+    /// where their clock stood. The clock runs on whether or not sound was
+    /// there to take, so this holds until the speakers stop. Needs sound
+    /// waiting.
+    fn learn_takes(&mut self) {
+        let period = Duration::from_secs_f64(self.period as f64 / f64::from(self.rate));
+        let until = Instant::now() + period + Duration::from_millis(2);
+        let padding = |speakers: &Self| unsafe { speakers.client.GetCurrentPadding() }.ok();
+        let Some(mut last) = padding(self) else {
+            return;
+        };
+        while Instant::now() < until {
+            std::thread::yield_now();
+            let Some(now) = padding(self) else {
+                return;
+            };
+            if now < last {
+                self.take_at = self.played();
+                return;
+            }
+            last = now;
+        }
+        self.missed += 1;
+    }
+}
+/// Frames the speakers' audio engine processes at a time.
+fn engine_period(client: &IAudioClient, rate: u32) -> usize {
+    use windows_core::Interface;
+    let current = client
+        .cast::<IAudioClient3>()
+        .ok()
+        .and_then(|client| unsafe {
+            let (mut format, mut frames) = (std::ptr::null_mut(), 0u32);
+            client
+                .GetCurrentSharedModeEnginePeriod(&mut format, &mut frames)
+                .ok()?;
+            CoTaskMemFree(Some(format as *const _));
+            Some(frames as usize)
+        });
+    current.filter(|frames| *frames > 0).unwrap_or_else(|| {
+        let mut default = 0i64;
+        let _ = unsafe { client.GetDevicePeriod(Some(&mut default), None) };
+        let default = if default > 0 { default } else { 100_000 };
+        (default as f64 * 1e-7 * f64::from(rate)).round() as usize
+    })
 }
 
 fn lock(push: &Mutex<Push<Wasapi>>) -> MutexGuard<'_, Push<Wasapi>> {
