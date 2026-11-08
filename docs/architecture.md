@@ -138,22 +138,42 @@ the target grows at once; with room to spare, and the buffer settled, it
 shrinks by up to 2 ms. The margin starts at 4 ms and widens by 3 ms each time
 the buffer runs dry.
 
-A packet is held in reserve only because one that arrives just before the
-speakers take sound misses that take when it comes a little late. On
-Windows the speakers' clock tells when they next take sound, so each packet's
-time to spare is known. It is counted from where packets usually arrive, so
-one late enough to miss its take counts as having less than none, rather
-than as early for the next. The reserve is held as soon as a packet comes
-within 2 ms of a take, and let go once every packet for 5 minutes has kept
-more than 3 ms clear (some devices deliver a packet late only every minute
-or two), which saves one speaker period (usually 10 ms). The two clocks
-drift, so this changes over minutes. The speakers take a whole period at a
-time, so the reserve is one period, however much arrives at once, and the
-margin there starts at 2 ms, only for packets of uneven size and the leaning
-of the rate; running dry widens it by 1 ms, for a minute.
-On a steady wired network between two Windows computers, sound plays here
-about 15 ms after it plays there while a packet is held in reserve, and
-sooner while packets fall clear of the takes.
+On Windows the speakers' clock tells when they next take sound, and they
+take a whole period at a time (usually 10 ms; some 3 ms, some 20 ms), so
+there protection comes in whole periods: holding part of a period more
+protects no better than holding none. Each packet's arrival is placed on the
+speakers' clock (the takes so far, from the frames written less those still
+waiting, and the time to the next) and set against where it would arrive
+were it never late, a packet's length after the last. So how late each
+packet came is known, even by more than a period, and wherever packets and
+periods differ in length. A packet that usually arrives some time before its
+take misses one take for each period by which its lateness exceeds that
+time, and the buffer must then still hold that many periods when it should
+have arrived. Where packets usually arrive moves as the two clocks drift, so
+it is followed packet by packet; how late they come is remembered as the
+latest of every 2 seconds, for 5 minutes (some devices deliver a packet late
+only every minute or two). Of those, the second latest counts, so that one
+stall of the network doesn't hold the delay high for 5 minutes, and never
+more periods than fit in 40 ms, the least the buffer keeps beyond its target
+before dropping the oldest. Until 5
+minutes have been seen, every packet needs a period, and the latest so far is
+scaled up by how much later the latest of 5 minutes' packets tends to be (the
+log of their number over the log of those heard). Each packet needs as many
+periods as that lateness, plus a guard, would make it miss: the guard is
+1 ms, and the drift that brings packets closer to their takes while the rate
+leaning brings a period in (two of its time constants, 22 s) counts as time
+to spare already gone. Held periods stay while half the guard again still
+asks for them, and for 10 seconds after. Each packet's fill, had it come as
+usual, less the periods it needs, must keep a 2 ms margin, which only absorbs
+the leaning of the rate; looks judge it with the buffer at its target while
+the buffer is still on its way there. Running dry adds the period that was
+missing for 10 seconds (one more for each further gap within them); a second
+gap within 5 minutes holds one period beyond the lateness measured for 5
+minutes, however many gaps follow. A gap made by a stall, whose packets then pile up beyond what the
+buffer keeps (the target, and at least 40 ms more), is not held for: no
+period held would have spared it. On a steady wired network between
+two Windows computers, sound plays here about 15 ms after it plays there
+while a period is held, and sooner while packets fall clear of the takes.
 
 After 2 seconds with nothing to play, the speakers pause, which costs
 nothing, and resume when sound arrives; after 10 minutes paused they close.

@@ -8,9 +8,15 @@
 //! a margin. At its very lowest it must still hold the margin. Short of either,
 //! the target grows at once; with room to spare, and the buffer settled, it
 //! shrinks a step. Each time the buffer runs dry the margin widens, so a
-//! network that is unsteady settles on a delay that suits it. Speakers that
-//! tell when they take sound take a whole period at a time, so there the
-//! reserve covers lateness and the margin starts narrower.
+//! network that is unsteady settles on a delay that suits it.
+//!
+//! Speakers that tell when they take sound take a whole period at a time, so
+//! there protection comes in whole periods: holding part of a period more
+//! protects no better than holding none. How many each packet needs is
+//! measured from how late packets come (see `push`), and each packet's own
+//! fill, less the periods it needs, must keep the margin, which then only
+//! absorbs the leaning of the rate. Running dry there adds the period that
+//! was missing, not a fixed 10 ms and a wider margin.
 use anyhow::Result;
 use rubato::{Adjustable, Async, FixedAsync, SincInterpolationParameters, Slip, WindowFunction};
 use std::time::Duration;
@@ -34,18 +40,12 @@ const SETTLED: Duration = Duration::from_millis(1);
 /// The margin kept from empty: at first, its growth each time the buffer runs
 /// dry, its most, and the looks without running dry before it narrows by 1 ms.
 const MARGIN: Duration = Duration::from_millis(4);
-/// The margin at first when the speakers tell when they take sound. They take
-/// a whole period at a time, so a late packet needs the reserve, a whole
-/// packet; the margin then only absorbs packets of uneven size and the
-/// leaning of the rate.
-/// There a wider margin helps little, so running dry widens it less, and it
-/// narrows again sooner: the target's own growth covers the gap.
+/// The margin when the speakers tell when they take sound. They take a whole
+/// period at a time, so a late packet needs whole periods held for it; the
+/// margin only absorbs the leaning of the rate, and running dry leaves it as
+/// it is: a wider margin would protect no better.
 #[cfg(any(windows, test))]
 const TIMED_MARGIN: Duration = Duration::from_millis(2);
-#[cfg(any(windows, test))]
-const TIMED_WIDER: Duration = Duration::from_millis(1);
-#[cfg(any(windows, test))]
-const TIMED_NARROW_AFTER: u32 = 30;
 const WIDER: Duration = Duration::from_millis(3);
 const MOST_MARGIN: Duration = Duration::from_millis(40);
 const NARROW_AFTER: u32 = 150;
@@ -57,6 +57,11 @@ pub(super) const EXCESS: Duration = Duration::from_millis(40);
 /// clock 100 ppm off settles 1 ms from the target; the target itself follows
 /// where the buffer actually runs, so that offset costs no margin.
 const GAIN: f64 = 0.1;
+/// Seconds the steering takes to bring the buffer most of the way to a new
+/// target: two of its time constants (`1 / GAIN`, plus the smoothing), which
+/// close 86 % of the distance, the margin covering the rest.
+#[cfg(any(windows, test))]
+pub(super) const SETTLE: f64 = 2.0 * (1.0 / GAIN + SMOOTHING);
 /// The furthest playback leans from its nominal rate. 0.5 % is inaudible.
 pub(super) const MOST_CORRECTION: f64 = 0.005;
 /// The buffer's fill is averaged over about this long before it steers the
@@ -103,12 +108,18 @@ pub(super) struct Pacing {
     largest_packet: usize,
     /// The frames the speakers take at a time, when they tell.
     period: Option<usize>,
+    /// Where they tell: since the last look, the least any packet's fill
+    /// held beyond the periods it needs, and that least for each recent
+    /// look, newest first.
+    cover: Option<isize>,
+    covers: [isize; LOOKS_REMEMBERED],
+    /// The most periods any packet needed this look and in each recent
+    /// look: they stay held until no packet of the recent looks needs them.
+    needed: [usize; LOOKS_REMEMBERED],
     /// Frames played since the last look.
     window: usize,
     /// Looks since the buffer last ran dry.
     calm: u32,
-    /// A packet is held in reserve (see the module's notes).
-    reserve: bool,
     pub(super) underruns: u64,
 }
 
@@ -131,9 +142,11 @@ impl Pacing {
             typicals: [0; LOOKS_REMEMBERED],
             largest_packet: 0,
             period: None,
+            cover: None,
+            covers: [0; LOOKS_REMEMBERED],
+            needed: [0; LOOKS_REMEMBERED],
             window: 0,
             calm: 0,
-            reserve: true,
             underruns: 0,
         };
         pacing.target = pacing.frames_in(START_DELAY);
@@ -144,8 +157,8 @@ impl Pacing {
     }
 
     /// The speakers tell when they take sound, `period` frames at a time:
-    /// keep the narrower margin that allows (see `TIMED_MARGIN`), and hold
-    /// one period in reserve, however much arrives at once. A margin already
+    /// keep the narrower margin that allows (see `TIMED_MARGIN`), and start
+    /// from one period held, however much arrives at once. A margin already
     /// widened by running dry stays as wide.
     #[cfg(any(windows, test))]
     pub(super) fn takes_known(&mut self, period: usize) {
@@ -156,15 +169,57 @@ impl Pacing {
                 self.margin = timed;
             }
             self.least_margin = timed;
-            // Start from a packet in reserve and the margin, not the
-            // general starting delay; the target grows at once if short.
+            // Start from a period held and the margin, not the general
+            // starting delay; the target grows at once if short.
             self.target = self
                 .target
                 .min(self.held() + 2 * timed)
                 .max(self.frames_in(MIN_DELAY));
-            self.wider = self.frames_in(TIMED_WIDER);
-            self.narrow_after = TIMED_NARROW_AFTER;
+            self.needed = [1; LOOKS_REMEMBERED];
+            self.wider = 0;
         }
+    }
+
+    /// The periods held: the most any packet of the recent looks needed.
+    fn periods_held(&self) -> usize {
+        self.needed.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Where the speakers tell when they take sound: a packet arrived with
+    /// `fill` frames buffered had it come when packets usually do. It needs
+    /// `up` periods held for it to come as late as packets have come lately,
+    /// with the guard; `down`, with half the guard again. More periods than
+    /// held are held at once; held ones stay while `down` still asks for
+    /// them, and are let go by the looks.
+    #[cfg(any(windows, test))]
+    pub(super) fn need(&mut self, up: usize, down: usize, fill: isize) {
+        let Some(period) = self.period else {
+            return;
+        };
+        let held = self.periods_held();
+        let periods = up.max(down.min(held));
+        let cover = fill - (periods * period) as isize;
+        if periods > held {
+            // The target must hold the periods and the margin; one that
+            // already does, as when a held period was let go only lately,
+            // needs nothing more, and growing it anyway would leave it longer
+            // each time packets drift past a take.
+            self.target = self
+                .target
+                .max(periods * period + self.margin)
+                .min(self.frames_in(MAX_DELAY));
+            self.forget_lows();
+        }
+        self.needed[0] = self.needed[0].max(periods);
+        self.cover = Some(self.cover.map_or(cover, |least| least.min(cover)));
+    }
+
+    /// Low points measured against an older target no longer tell how far
+    /// the target may shrink.
+    fn forget_lows(&mut self) {
+        self.lows = [0; LOOKS_REMEMBERED];
+        self.typicals = [0; LOOKS_REMEMBERED];
+        self.covers = [0; LOOKS_REMEMBERED];
     }
 
     pub(super) fn rate(&self) -> u32 {
@@ -193,7 +248,8 @@ impl Pacing {
         self.largest_packet = self.largest_packet.max(frames);
     }
 
-    /// The frames held in reserve while a packet is.
+    /// The frames of a packet in reserve: a period where the speakers tell
+    /// it, else the most that has arrived at once.
     fn held(&self) -> usize {
         self.period.unwrap_or(self.largest_packet)
     }
@@ -206,28 +262,45 @@ impl Pacing {
         }
     }
 
-    /// Hold a packet in reserve, or not. Holding starts at once.
+    /// The speakers no longer tell when they take sound: back to the general
+    /// rules at once, with a packet in reserve and the general margin, as the
+    /// periods held for measured lateness no longer stand for anything.
     #[cfg(any(windows, test))]
-    pub(super) fn hold_reserve(&mut self, hold: bool) {
-        if hold && !self.reserve {
-            self.target = self
-                .target
-                .max(self.held() + self.margin)
-                .min(self.frames_in(MAX_DELAY));
-            self.lows = [0; LOOKS_REMEMBERED];
-            self.typicals = [0; LOOKS_REMEMBERED];
+    pub(super) fn takes_unknown(&mut self) {
+        if self.period.take().is_none() {
+            return;
         }
-        self.reserve = hold;
+        let general = self.frames_in(MARGIN);
+        self.margin = self.margin.max(general);
+        self.least_margin = general;
+        self.wider = self.frames_in(WIDER);
+        self.needed = [0; LOOKS_REMEMBERED];
+        self.cover = None;
+        self.target = self
+            .target
+            .max(self.held() + self.margin)
+            .min(self.frames_in(MAX_DELAY));
+        self.forget_lows();
     }
 
+    /// The buffer ran dry. Where the speakers tell when they take sound, a
+    /// packet came later than the periods held for it, so one period more is
+    /// held for the looks remembered (10 s), one more for each further gap
+    /// within them; longer only if `push` sees a second gap within 5 minutes.
     pub(super) fn ran_dry(&mut self) {
         self.underruns += 1;
-        self.target = (self.target + self.frames_in(LONGER)).min(self.frames_in(MAX_DELAY));
+        let longer = match self.period {
+            Some(period) => {
+                self.needed[0] = self.periods_held() + 1;
+                period
+            }
+            None => self.frames_in(LONGER),
+        };
+        self.target = (self.target + longer).min(self.frames_in(MAX_DELAY));
         self.margin = (self.margin + self.wider).min(self.frames_in(MOST_MARGIN));
         self.calm = 0;
         self.last_mean = None;
-        self.lows = [0; LOOKS_REMEMBERED];
-        self.typicals = [0; LOOKS_REMEMBERED];
+        self.forget_lows();
         self.start_window();
     }
 
@@ -237,6 +310,7 @@ impl Pacing {
         self.takes = 0;
         self.low_count = 0;
         self.window = 0;
+        self.cover = None;
     }
 
     /// `frames` were played while sound streams in, leaving `fill`. Every so
@@ -250,11 +324,13 @@ impl Pacing {
             return;
         }
         let mean = (self.fills / self.takes) as usize;
-        let settled = self
-            .last_mean
-            .replace(mean)
-            .is_some_and(|last| last.abs_diff(mean) <= self.frames_in(SETTLED));
+        let last = self.last_mean.replace(mean);
+        let settled = last.is_some_and(|last| last.abs_diff(mean) <= self.frames_in(SETTLED));
         let lowest = self.lowest;
+        if let (Some(period), Some(cover)) = (self.period, self.cover) {
+            self.timed_look(settled, last, mean, lowest, cover, period);
+            return;
+        }
         // The low point nine in ten stay above.
         let typical = if self.low_count >= 10 {
             let points = &mut self.low_points[..self.low_count];
@@ -262,8 +338,7 @@ impl Pacing {
         } else {
             lowest
         };
-        let packet = if self.reserve { self.held() } else { 0 };
-        let (margin, reserve) = (self.margin, packet + self.margin);
+        let (margin, reserve) = (self.margin, self.held() + self.margin);
         // Shorten only on what the last several looks all allow: a dip that
         // comes now and then must not be forgotten between two looks.
         self.lows.rotate_right(1);
@@ -283,6 +358,78 @@ impl Pacing {
                 .saturating_sub(shorter)
                 .max(self.frames_in(MIN_DELAY));
         }
+        self.end_look();
+    }
+
+    /// A look where the speakers tell when they take sound. Every packet's
+    /// fill must keep the margin beyond the periods it needs (`cover`), and
+    /// the very lowest fill must keep the margin too. Short of either, the
+    /// target grows at once; with room to spare in every recent look, and
+    /// the buffer settled, it shrinks a step.
+    ///
+    /// While the buffer is still on its way to the target, its mean moving
+    /// toward it since the last look (`last`), both are judged with it there.
+    /// Falling from above, as just after the target shrank, it has room it is
+    /// about to lose, so what it runs above counts against both. Rising from
+    /// below, as just after more periods are held or a held one was spent as
+    /// the packets drifted past a take, the cover it lacks only for that is
+    /// already asked for, and asking again each look would leave the target
+    /// periods too long once it arrives: so what it runs below counts toward
+    /// the cover, but never more than the periods held, and not toward the
+    /// lowest fill. A packet that comes late meanwhile runs the buffer dry at
+    /// worst, which tops it up to the whole target at once and holds a period
+    /// more. A buffer that stays off the target, as the leaning of the rate
+    /// keeps it against the clocks' drift, is judged where it runs, so the
+    /// target follows it.
+    fn timed_look(
+        &mut self,
+        settled: bool,
+        last: Option<usize>,
+        mean: usize,
+        lowest: usize,
+        cover: isize,
+        period: usize,
+    ) {
+        let margin = self.margin as isize;
+        let falling = last.is_some_and(|last| last > mean);
+        let rising = last.is_some_and(|last| last < mean);
+        let ahead = if falling {
+            mean.saturating_sub(self.target) as isize
+        } else {
+            0
+        };
+        let behind = if rising {
+            self.target
+                .saturating_sub(mean)
+                .min(self.periods_held() * period) as isize
+        } else {
+            0
+        };
+        let lowest = (lowest as isize - ahead).max(0);
+        let cover = cover - ahead + behind;
+        self.lows.rotate_right(1);
+        self.lows[0] = lowest as usize;
+        self.covers.rotate_right(1);
+        self.covers[0] = cover;
+        let lowest_lately = self.lows.iter().copied().min().unwrap_or(0) as isize;
+        let cover_lately = self.covers.iter().copied().min().unwrap_or(cover);
+        let short = (margin - lowest).max(margin - cover);
+        if short > margin / 2 {
+            self.target = (self.target + short as usize).min(self.frames_in(MAX_DELAY));
+        } else if settled && lowest_lately > margin && cover_lately > margin {
+            let spare = (lowest_lately - margin).min(cover_lately - margin) as usize;
+            let shorter = (spare / 2).min(self.frames_in(MOST_SHORTER));
+            self.target = self
+                .target
+                .saturating_sub(shorter)
+                .max(self.frames_in(MIN_DELAY));
+        }
+        self.needed.rotate_right(1);
+        self.needed[0] = 0;
+        self.end_look();
+    }
+
+    fn end_look(&mut self) {
         self.calm += 1;
         if self.calm >= self.narrow_after {
             self.calm = 0;
@@ -364,14 +511,12 @@ mod tests {
         let mut pacing = Pacing::new(48_000);
         pacing.takes_known(480);
         assert_eq!(pacing.margin, 96);
+        let target = pacing.target;
         pacing.ran_dry();
         pacing.takes_known(480);
-        assert_eq!(pacing.margin, 96 + 48, "widens by 1 ms, and stays wide");
-        for _ in 0..TIMED_NARROW_AFTER {
-            pacing.window = pacing.frames_in(LOOK_EVERY);
-            pacing.played(0, pacing.target);
-        }
-        assert_eq!(pacing.margin, 96, "narrows again a minute later");
+        assert_eq!(pacing.margin, 96, "running dry leaves the margin");
+        assert_eq!(pacing.target, target + 480, "and adds the missing period");
+        assert_eq!(pacing.periods_held(), 2);
         let mut pacing = Pacing::new(48_000);
         pacing.ran_dry();
         pacing.takes_known(480);
@@ -380,6 +525,48 @@ mod tests {
             192 + 144,
             "already widened before the takes were known"
         );
+    }
+
+    /// End a look in which every packet needed `periods` and had `fill`.
+    fn look(pacing: &mut Pacing, periods: usize, fill: usize) {
+        pacing.need(periods, periods, fill as isize);
+        pacing.window = pacing.frames_in(LOOK_EVERY);
+        pacing.played(0, fill);
+    }
+
+    #[test]
+    fn a_gap_holds_a_period_more_for_a_few_looks() {
+        let mut pacing = Pacing::new(48_000);
+        pacing.takes_known(480);
+        for _ in 0..LOOKS_REMEMBERED {
+            look(&mut pacing, 0, 2_000);
+        }
+        assert_eq!(pacing.periods_held(), 0);
+        pacing.ran_dry();
+        assert_eq!(pacing.periods_held(), 1);
+        for _ in 0..LOOKS_REMEMBERED - 1 {
+            look(&mut pacing, 0, 2_000);
+            assert_eq!(pacing.periods_held(), 1);
+        }
+        look(&mut pacing, 0, 2_000);
+        assert_eq!(pacing.periods_held(), 0, "let go 10 s later");
+    }
+
+    #[test]
+    fn speakers_that_stop_telling_hold_a_packet_again_at_once() {
+        let mut pacing = Pacing::new(48_000);
+        pacing.packet(480);
+        pacing.takes_known(480);
+        // Packets well clear of the takes: no period held.
+        pacing.target = 200;
+        pacing.needed = [0; LOOKS_REMEMBERED];
+        pacing.takes_unknown();
+        assert_eq!(pacing.margin, pacing.frames_in(MARGIN));
+        assert!(pacing.target >= 480 + pacing.frames_in(MARGIN));
+        assert_eq!(pacing.periods_held(), 0);
+        // And they may tell again later.
+        pacing.takes_known(480);
+        assert_eq!(pacing.margin, pacing.frames_in(TIMED_MARGIN));
     }
 
     #[test]
