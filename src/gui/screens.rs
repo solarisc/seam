@@ -138,11 +138,15 @@ impl App {
                             widgets::muted(ui, side_phrase(computer.arrangement.side));
                         });
                     });
-                    if local.len() > 1 || computer.monitors.len() > 1 {
+                    let gone = gone_displays(link, &local);
+                    if local.len() > 1 || computer.monitors.len() > 1 || gone.local || gone.remote
+                    {
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             ui.add_space(18.0);
-                            if let Some(choice) = display_pickers(ui, &local, computer, editable) {
+                            if let Some(choice) =
+                                display_pickers(ui, &local, computer, gone, editable)
+                            {
                                 change = Some((computer.key, choice));
                             }
                         });
@@ -514,33 +518,68 @@ enum Choice {
     Remote(Option<u32>),
 }
 
+/// No display has this number. A picker showing it reads "Disconnected
+/// display", and choosing any display replaces it.
+const GONE: u32 = 0;
+
+/// Whether the display a computer's edge belongs to is gone, on this
+/// computer (`local`) or the other one (`remote`), as the agents found when
+/// they connected. The main display normally stands in, but an older Seam
+/// controlling this computer leaves the edge without a display. The person
+/// picks one then, even when only one is left.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Gone {
+    local: bool,
+    remote: bool,
+}
+
+fn gone_displays(link: Option<&LinkStatus>, local: &[Monitor]) -> Gone {
+    let Some((link, report)) = link
+        .filter(|link| link.connected)
+        .and_then(|link| Some((link, link.layout.as_ref()?)))
+        // Until the computers settle a layout, its displays aren't checked.
+        .filter(|(_, report)| report.revision != 0)
+    else {
+        return Gone::default();
+    };
+    let gone = |selected: Option<u32>, displays: &[Monitor]| {
+        !displays.is_empty() && selected.is_some_and(|id| displays.iter().all(|m| m.id != id))
+    };
+    Gone {
+        local: gone(report.layout.local_monitor, local),
+        remote: gone(report.layout.remote_monitor, &link.remote_monitors),
+    }
+}
+
 fn display_pickers(
     ui: &mut Ui,
     local: &[Monitor],
     computer: &arrangement::Computer,
+    gone: Gone,
     enabled: bool,
 ) -> Option<Choice> {
+    let selected = |gone: bool, id: Option<u32>| if gone { Some(GONE) } else { id };
     let mut choice = None;
     ui.add_enabled_ui(enabled, |ui| {
-        if local.len() > 1 {
+        if local.len() > 1 || gone.local {
             widgets::muted(ui, "This display");
             if let Some(id) = picker(
                 ui,
                 ("local", computer.key),
                 local,
-                computer.arrangement.local_monitor,
+                selected(gone.local, computer.arrangement.local_monitor),
             ) {
                 choice = Some(Choice::Local(id));
             }
             ui.add_space(12.0);
         }
-        if computer.monitors.len() > 1 {
+        if computer.monitors.len() > 1 || gone.remote {
             widgets::muted(ui, format!("{} display", computer.name));
             if let Some(id) = picker(
                 ui,
                 ("remote", computer.key),
                 &computer.monitors,
-                computer.arrangement.remote_monitor,
+                selected(gone.remote, computer.arrangement.remote_monitor),
             ) {
                 choice = Some(Choice::Remote(id));
             }
@@ -725,5 +764,73 @@ mod tests {
             "Right PC closed the connection while connecting. If this keeps happening, restart Seam on Right PC."
         );
         assert!(!message.contains("version"));
+    }
+
+    #[test]
+    fn a_display_that_is_gone_offers_a_choice_even_when_one_is_left() {
+        let display = |id| Monitor {
+            id,
+            identity: None,
+            name: format!("Display {id}"),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+        };
+        // A Mac whose built-in display (1) is closed, leaving only an
+        // external one (3); the agent marks the edge's display as gone (0).
+        let link = |local_monitor, remote_monitor, revision| LinkStatus {
+            peer: Some(0),
+            connected: true,
+            name: "Mac".into(),
+            address: "192.0.2.5:47843".into(),
+            os: "macos".into(),
+            remote_monitors: vec![display(3)],
+            layout: Some(crate::layout::Report {
+                layout: crate::layout::Layout {
+                    side: Side::Left,
+                    edge_offset: 0.0,
+                    local_monitor,
+                    remote_monitor,
+                },
+                revision,
+                ready: false,
+                pending: false,
+                error: String::new(),
+            }),
+            controlling: false,
+            controlled: false,
+            rtt_us: None,
+            sent_events: 0,
+            received_events: 0,
+            last_error: String::new(),
+        };
+        let local = [display(7)];
+        let gone = |link: &LinkStatus| gone_displays(Some(link), &local);
+        assert_eq!(
+            gone(&link(Some(7), Some(0), 9)),
+            Gone {
+                local: false,
+                remote: true
+            }
+        );
+        assert_eq!(
+            gone(&link(Some(1), Some(3), 9)),
+            Gone {
+                local: true,
+                remote: false
+            }
+        );
+        // The main display, or the one chosen, is still there.
+        assert_eq!(gone(&link(None, Some(3), 9)), Gone::default());
+        // Not settled yet, or not connected: nothing to check.
+        assert_eq!(gone(&link(Some(7), Some(0), 0)), Gone::default());
+        let offline = LinkStatus {
+            connected: false,
+            ..link(Some(7), Some(0), 9)
+        };
+        assert_eq!(gone(&offline), Gone::default());
+        assert_eq!(gone_displays(None, &local), Gone::default());
     }
 }

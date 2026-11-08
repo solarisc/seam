@@ -2,6 +2,7 @@ pub mod agent;
 pub mod clipboard;
 pub mod config;
 pub mod discovery;
+mod display_watch;
 pub mod geometry;
 pub mod input;
 #[cfg(target_os = "macos")]

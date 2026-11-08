@@ -65,59 +65,23 @@ pub fn monitors() -> anyhow::Result<Vec<Monitor>> {
 pub fn monitor_geometry(known: &[Monitor]) -> anyhow::Result<Vec<Monitor>> {
     #[cfg(target_os = "macos")]
     {
-        #[repr(C)]
-        struct Point {
-            x: f64,
-            y: f64,
-        }
-        #[repr(C)]
-        struct Size {
-            width: f64,
-            height: f64,
-        }
-        #[repr(C)]
-        struct Rect {
-            origin: Point,
-            size: Size,
-        }
-        #[link(name = "CoreGraphics", kind = "framework")]
-        unsafe extern "C" {
-            fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
-            fn CGDisplayBounds(id: u32) -> Rect;
-            fn CGDisplayIsMain(id: u32) -> u32;
-        }
-        let mut count = 0;
-        anyhow::ensure!(
-            unsafe { CGGetActiveDisplayList(0, std::ptr::null_mut(), &mut count) } == 0,
-            "Cannot count active displays"
-        );
-        // The inventory can grow between the two calls; the next refresh picks
-        // up any additional display. The API writes at most the given capacity.
-        let mut displays = vec![0; count as usize];
-        anyhow::ensure!(
-            unsafe { CGGetActiveDisplayList(count, displays.as_mut_ptr(), &mut count) } == 0,
-            "Cannot read active displays"
-        );
-        displays.truncate(count as usize);
+        let displays = crate::mac_displays::active()?;
         let identities = crate::mac_displays::identities()?;
         Ok(displays
             .into_iter()
-            .map(|id| {
-                let bounds = unsafe { CGDisplayBounds(id) };
-                Monitor {
-                    id,
-                    identity: identities.get(&id).cloned(),
-                    name: known
-                        .iter()
-                        .find(|m| m.id == id)
-                        .map(|m| m.name.clone())
-                        .unwrap_or_else(|| format!("Display {id}")),
-                    x: bounds.origin.x as i32,
-                    y: bounds.origin.y as i32,
-                    width: bounds.size.width as u32,
-                    height: bounds.size.height as u32,
-                    primary: unsafe { CGDisplayIsMain(id) } != 0,
-                }
+            .map(|display| Monitor {
+                id: display.id,
+                identity: identities.get(&display.id).cloned(),
+                name: known
+                    .iter()
+                    .find(|m| m.id == display.id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| format!("Display {}", display.id)),
+                x: display.x,
+                y: display.y,
+                width: display.width,
+                height: display.height,
+                primary: display.main,
             })
             .collect())
     }

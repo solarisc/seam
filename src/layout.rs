@@ -65,7 +65,9 @@ impl Layout {
                     .find(|m| m.primary)
                     .or_else(|| monitors.first()),
             }
-            .ok_or_else(|| anyhow::anyhow!("Selected display is no longer available"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Selected display is no longer available; choose another")
+            })?;
             ensure!(
                 monitor.width > 0 && monitor.height > 0,
                 "Invalid display size"
@@ -215,7 +217,9 @@ impl Service {
 
     /// A desktop change invalidates the current coordinate space. End the input
     /// session so its receiver releases held input, then exchange fresh displays
-    /// on reconnect. Never transfer an existing seam to an unrelated monitor.
+    /// on reconnect. A seam display that is gone is stood in for by the main
+    /// display until it returns; a reused display number never decides
+    /// (see `Arrangement::restore_local`).
     pub fn update_monitors(&self, mut local: Vec<Monitor>) {
         local.sort_by_key(|m| m.id);
         let mut state = self.state.lock().unwrap();

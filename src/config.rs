@@ -4,7 +4,6 @@ use data_encoding::BASE32_NOPAD;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -76,7 +75,7 @@ impl Arrangement {
         restore_display_id(
             &mut self.local_monitor,
             self.local_monitor_uuid.as_deref(),
-            &display_identities(local),
+            local,
         );
     }
 
@@ -84,7 +83,7 @@ impl Arrangement {
         restore_display_id(
             &mut self.remote_monitor,
             self.remote_monitor_uuid.as_deref(),
-            &display_identities(remote),
+            remote,
         );
     }
 
@@ -416,7 +415,7 @@ impl Config {
         #[cfg(target_os = "windows")]
         let ids = crate::windows_displays::identities();
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let ids: Result<BTreeMap<u32, String>> = Ok(BTreeMap::new());
+        let ids: Result<std::collections::BTreeMap<u32, String>> = Ok(Default::default());
         let Ok(ids) = ids else { return };
         for arrangement in std::iter::once(&mut self.arrangement)
             .chain(self.peers.iter_mut().map(|peer| &mut peer.arrangement))
@@ -449,7 +448,14 @@ fn validate_arrangement(arrangement: &Arrangement) -> Result<()> {
 
 fn remember_identity(selected: Option<u32>, identity: &mut Option<String>, monitors: &[Monitor]) {
     if let Some(monitor) = monitors.iter().find(|m| Some(m.id) == selected) {
-        if monitor.identity.is_some() {
+        // A display standing in for a remembered one that isn't connected
+        // leaves that one remembered, so the edge goes back to it. Choosing a
+        // display clears the identity first (`Layout::write_to`), so a choice
+        // is always remembered.
+        let standing_in = identity
+            .as_deref()
+            .is_some_and(|remembered| with_identity(monitors, remembered).is_none());
+        if monitor.identity.is_some() && !standing_in {
             identity.clone_from(&monitor.identity);
         }
     } else if selected.is_none() {
@@ -457,25 +463,46 @@ fn remember_identity(selected: Option<u32>, identity: &mut Option<String>, monit
     }
 }
 
-fn display_identities(monitors: &[Monitor]) -> BTreeMap<u32, String> {
-    monitors
+/// The one display with this persistent identity. An identity that several
+/// displays share, as mirrored ones can, names none of them.
+fn with_identity<'a>(monitors: &'a [Monitor], identity: &str) -> Option<&'a Monitor> {
+    let mut matches = monitors
         .iter()
-        .filter_map(|m| m.identity.clone().map(|identity| (m.id, identity)))
-        .collect()
+        .filter(|m| m.identity.as_deref() == Some(identity));
+    match (matches.next(), matches.next()) {
+        (Some(monitor), None) => Some(monitor),
+        _ => None,
+    }
 }
 
-fn restore_display_id(selected: &mut Option<u32>, uuid: Option<&str>, ids: &BTreeMap<u32, String>) {
-    if let Some(uuid) = uuid {
-        // Zero is not a valid active display: an absent monitor must never silently
-        // redirect input to a different display that reused its old number.
-        let mut matches = ids.iter().filter(|(_, value)| value.as_str() == uuid);
-        let first = matches.next();
-        *selected = Some(if matches.next().is_none() {
-            first.map_or(0, |(&id, _)| id)
-        } else {
-            0
-        });
-    }
+/// Point `selected` at the remembered display (`uuid`) in this desktop
+/// session's numbering. Only the identity says which display that is: a
+/// number that another display took over is never trusted. Without an
+/// identity, a chosen number holds while a display has it.
+///
+/// While the remembered display isn't connected, the main display stands in,
+/// so the pointer keeps crossing. The identity stays remembered (see
+/// `remember_identity`), and the edge goes back to its display once it's
+/// connected again.
+fn restore_display_id(selected: &mut Option<u32>, uuid: Option<&str>, monitors: &[Monitor]) {
+    let found = match (uuid, *selected) {
+        (Some(uuid), _) => with_identity(monitors, uuid).map(|m| m.id),
+        // "Main display": whichever it is when the computers connect.
+        (None, None) => return,
+        (None, Some(id)) => monitors.iter().any(|m| m.id == id).then_some(id),
+    };
+    // Zero is no display: with none connected, nothing can stand in.
+    *selected = Some(found.or_else(|| main_display(monitors)).unwrap_or(0));
+}
+
+/// The display used when none was chosen, or the chosen one is gone: the
+/// main display, as `Layout::resolve` and `Geometry::new` pick it.
+fn main_display(monitors: &[Monitor]) -> Option<u32> {
+    monitors
+        .iter()
+        .find(|m| m.primary)
+        .or_else(|| monitors.first())
+        .map(|m| m.id)
 }
 
 pub fn random_secret() -> String {
@@ -574,23 +601,78 @@ mod tests {
         }
     }
 
+    fn display(id: u32, identity: &str, primary: bool) -> Monitor {
+        Monitor {
+            id,
+            identity: Some(identity.into()),
+            name: format!("Display {id}"),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary,
+        }
+    }
+
     #[test]
     fn display_identity_survives_reboot_and_never_selects_a_reused_id() {
-        let ids = [
-            (1, "built-in".into()),
-            (2, "external".into()),
-            (3, "different".into()),
-        ]
-        .into();
+        let monitors = [
+            display(1, "built-in", false),
+            display(2, "external", true),
+            display(3, "different", false),
+        ];
         let mut selected = Some(3);
-        restore_display_id(&mut selected, Some("external"), &ids);
+        restore_display_id(&mut selected, Some("external"), &monitors);
         assert_eq!(selected, Some(2));
-        restore_display_id(&mut selected, Some("unplugged"), &ids);
+        restore_display_id(&mut selected, None, &monitors);
+        assert_eq!(selected, Some(2));
+        // The remembered display's old number now belongs to another one:
+        // the main display stands in, never the display with that number.
+        let mut selected = Some(3);
+        restore_display_id(&mut selected, Some("unplugged"), &monitors);
+        assert_eq!(selected, Some(2));
+        // Back again: its own display.
+        restore_display_id(&mut selected, Some("built-in"), &monitors);
+        assert_eq!(selected, Some(1));
+    }
+
+    #[test]
+    fn the_main_display_stands_in_while_the_remembered_one_is_gone() {
+        let monitors = [display(1, "built-in", false), display(4, "external", true)];
+        // Without an identity, a chosen number holds while a display has it.
+        let mut selected = Some(1);
+        restore_display_id(&mut selected, None, &monitors);
+        assert_eq!(selected, Some(1));
+        let mut selected = Some(9);
+        restore_display_id(&mut selected, None, &monitors);
+        assert_eq!(selected, Some(4));
+        // "Main display" is resolved when the computers connect.
+        let mut selected = None;
+        restore_display_id(&mut selected, None, &monitors);
+        assert_eq!(selected, None);
+        // Mirrored displays sharing an identity name neither of them.
+        let mirrored = [display(1, "twin", false), display(2, "twin", true)];
+        let mut selected = Some(1);
+        restore_display_id(&mut selected, Some("twin"), &mirrored);
+        assert_eq!(selected, Some(2));
+        // With no display at all, nothing can stand in.
+        restore_display_id(&mut selected, Some("built-in"), &[]);
         assert_eq!(selected, Some(0));
-        restore_display_id(&mut selected, Some("external"), &ids);
-        assert_eq!(selected, Some(2));
-        restore_display_id(&mut selected, None, &ids);
-        assert_eq!(selected, Some(2));
+
+        // Standing in leaves the gone display remembered, so the edge goes
+        // back to it; a display that is chosen is remembered.
+        let mut remembered = Some("lid closed".to_string());
+        remember_identity(Some(4), &mut remembered, &monitors);
+        assert_eq!(remembered.as_deref(), Some("lid closed"));
+        let mut remembered = Some("built-in".to_string());
+        remember_identity(Some(1), &mut remembered, &monitors);
+        assert_eq!(remembered.as_deref(), Some("built-in"));
+        // `Layout::write_to` clears the identity when another is chosen.
+        let mut remembered = None;
+        remember_identity(Some(4), &mut remembered, &monitors);
+        assert_eq!(remembered.as_deref(), Some("external"));
+        remember_identity(None, &mut remembered, &monitors);
+        assert_eq!(remembered, None);
     }
 
     #[test]
