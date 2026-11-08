@@ -290,7 +290,10 @@ impl<S: Speaker> Push<S> {
         self.write_input()?;
         let output_rate = self.speakers_rate();
         let clear = match self.speaker.as_mut().and_then(Speaker::next_take) {
-            Some((spare, _)) => self.arrivals.saw(spare, output_rate),
+            Some((spare, _)) => {
+                self.pacing.takes_known();
+                self.arrivals.saw(spare, output_rate)
+            }
             None => {
                 self.arrivals = Arrivals::default();
                 false

@@ -144,9 +144,12 @@ Windows the speakers' clock tells when they next take sound, so each packet's
 time to spare is known: the reserve is held as soon as a packet comes within
 2 ms of a take, and let go once every packet for 30 seconds has kept more
 than 3 ms clear, which saves one speaker period (usually 10 ms). The two
-clocks drift, so this changes over minutes. On a steady wired network between
-two Windows computers, sound plays here about 15 to 30 ms after it plays
-there, depending on where packets fall between the speakers' takes.
+clocks drift, so this changes over minutes. The speakers take a whole period
+at a time, so the reserve is what covers a late packet, and the margin there
+starts at 1 ms, only for packets of uneven size and the leaning of the rate.
+On a steady wired network between two Windows computers, sound plays here
+about 15 ms after it plays there while a packet is held in reserve, and
+sooner while packets fall clear of the takes.
 
 After 2 seconds with nothing to play, the speakers pause, which costs
 nothing, and resume when sound arrives; after 10 minutes paused they close.

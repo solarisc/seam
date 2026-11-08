@@ -8,7 +8,9 @@
 //! a margin. At its very lowest it must still hold the margin. Short of either,
 //! the target grows at once; with room to spare, and the buffer settled, it
 //! shrinks a step. Each time the buffer runs dry the margin widens, so a
-//! network that is unsteady settles on a delay that suits it.
+//! network that is unsteady settles on a delay that suits it. Speakers that
+//! tell when they take sound take a whole period at a time, so there the
+//! reserve covers lateness and the margin starts narrower.
 use anyhow::Result;
 use rubato::{Adjustable, Async, FixedAsync, SincInterpolationParameters, Slip, WindowFunction};
 use std::time::Duration;
@@ -32,6 +34,12 @@ const SETTLED: Duration = Duration::from_millis(1);
 /// The margin kept from empty: at first, its growth each time the buffer runs
 /// dry, its most, and the looks without running dry before it narrows by 1 ms.
 const MARGIN: Duration = Duration::from_millis(4);
+/// The margin at first when the speakers tell when they take sound. They take
+/// a whole period at a time, so a late packet needs the reserve, a whole
+/// packet; the margin then only absorbs packets of uneven size and the
+/// leaning of the rate.
+#[cfg(any(windows, test))]
+const TIMED_MARGIN: Duration = Duration::from_millis(1);
 const WIDER: Duration = Duration::from_millis(3);
 const MOST_MARGIN: Duration = Duration::from_millis(40);
 const NARROW_AFTER: u32 = 150;
@@ -65,6 +73,8 @@ pub(super) struct Pacing {
     rate: u32,
     target: usize,
     margin: usize,
+    /// The narrowest the margin gets.
+    least_margin: usize,
     /// Since the last look: the fewest frames left, and the sum and count of
     /// fills, for their mean.
     lowest: usize,
@@ -97,6 +107,7 @@ impl Pacing {
             rate: rate.max(1),
             target: 0,
             margin: 0,
+            least_margin: 0,
             lowest: usize::MAX,
             fills: 0,
             takes: 0,
@@ -113,7 +124,22 @@ impl Pacing {
         };
         pacing.target = pacing.frames_in(START_DELAY);
         pacing.margin = pacing.frames_in(MARGIN);
+        pacing.least_margin = pacing.margin;
         pacing
+    }
+
+    /// The speakers tell when they take sound: keep the narrower margin that
+    /// allows (see `TIMED_MARGIN`). A margin already widened by running dry
+    /// stays as wide.
+    #[cfg(any(windows, test))]
+    pub(super) fn takes_known(&mut self) {
+        let timed = self.frames_in(TIMED_MARGIN);
+        if self.least_margin != timed {
+            if self.margin == self.least_margin {
+                self.margin = timed;
+            }
+            self.least_margin = timed;
+        }
     }
 
     pub(super) fn rate(&self) -> u32 {
@@ -233,7 +259,7 @@ impl Pacing {
             self.margin = self
                 .margin
                 .saturating_sub(self.frames_in(Duration::from_millis(1)))
-                .max(self.frames_in(MARGIN));
+                .max(self.least_margin);
         }
         self.start_window();
     }
@@ -301,6 +327,24 @@ mod tests {
         }
         assert_eq!(pacing.delay(), MAX_DELAY);
         assert_eq!(pacing.margin, pacing.frames_in(MOST_MARGIN));
+    }
+
+    #[test]
+    fn speakers_that_tell_their_takes_keep_a_narrower_margin() {
+        let mut pacing = Pacing::new(48_000);
+        pacing.takes_known();
+        assert_eq!(pacing.margin, 48);
+        pacing.ran_dry();
+        pacing.takes_known();
+        assert_eq!(pacing.margin, 48 + 144, "a widened margin stays wide");
+        let mut pacing = Pacing::new(48_000);
+        pacing.ran_dry();
+        pacing.takes_known();
+        assert_eq!(
+            pacing.margin,
+            192 + 144,
+            "already widened before the takes were known"
+        );
     }
 
     #[test]
