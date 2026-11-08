@@ -78,6 +78,7 @@ impl Paired {
             code: self.code,
             arrangement: crate::config::Arrangement::on(side),
             mac: None,
+            sound: false,
         })
     }
 }

@@ -3,6 +3,7 @@ use super::{App, arrangement, theme, widgets};
 use crate::{
     config::Side,
     protocol::Monitor,
+    sound::Status as SoundStatus,
     status::{LinkStatus, NearbyPeer},
     transfers::size,
 };
@@ -95,6 +96,7 @@ impl App {
         widgets::section(ui, "Computers", None);
         let p = theme::palette(ui);
         let mut change: Option<(Option<usize>, Choice)> = None;
+        let mut sound: Option<(usize, bool)> = None;
         widgets::list(ui, |list| {
             for computer in &computers {
                 let link = links.iter().find(|l| l.peer == computer.key);
@@ -151,6 +153,27 @@ impl App {
                             }
                         });
                     }
+                    match computer.key {
+                        Some(index) => {
+                            let on = self.config.peers.get(index).is_some_and(|peer| peer.sound);
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(18.0);
+                                if let Some(on) = sound_switch(ui, on, link, !self.busy()) {
+                                    sound = Some((index, on));
+                                }
+                            });
+                        }
+                        None => {
+                            if let Some(text) = link.and_then(sharing_sound) {
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(18.0);
+                                    widgets::muted(ui, text);
+                                });
+                            }
+                        }
+                    }
                 });
             }
         });
@@ -159,6 +182,9 @@ impl App {
                 Choice::Local(id) => arrangement.local_monitor = id,
                 Choice::Remote(id) => arrangement.remote_monitor = id,
             });
+        }
+        if let Some((index, on)) = sound {
+            self.set_sound(index, on);
         }
 
         let transfers = self
@@ -612,6 +638,51 @@ fn picker(
     (value != selected).then_some(value)
 }
 
+/// The switch that plays a controlled computer's sound here, with what its
+/// sound is doing. Returns the switch's new position when it was clicked.
+fn sound_switch(ui: &mut Ui, on: bool, link: Option<&LinkStatus>, enabled: bool) -> Option<bool> {
+    let p = theme::palette(ui);
+    let mut wanted = on;
+    let clicked = widgets::toggle_enabled(ui, &mut wanted, enabled)
+        .on_hover_text("Play this computer's sound through this computer's speakers or headphones")
+        .changed();
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Play its sound here")
+            .font(theme::small())
+            .color(p.text),
+    );
+    if let Some(state) = link.filter(|link| on && link.connected).map(sound_state) {
+        widgets::muted(ui, "·");
+        widgets::muted(ui, state);
+    }
+    clicked.then_some(wanted)
+}
+
+/// What a controlled computer's sound is doing, while it's on.
+fn sound_state(link: &LinkStatus) -> String {
+    match &link.sound {
+        SoundStatus::Off | SoundStatus::Connecting => "Connecting…".into(),
+        SoundStatus::Quiet => "Nothing playing".into(),
+        SoundStatus::Playing => "Playing".into(),
+        SoundStatus::Unavailable(reason) => reason.clone(),
+    }
+}
+
+/// On a controlled computer: whether its sound is going to the computer
+/// controlling it.
+fn sharing_sound(link: &LinkStatus) -> Option<&'static str> {
+    match link.sound {
+        SoundStatus::Quiet | SoundStatus::Playing => {
+            Some("This computer's sound plays on the computer controlling it")
+        }
+        SoundStatus::Unavailable(_) => {
+            Some("This computer's sound can't be shared. The computer controlling it shows why.")
+        }
+        SoundStatus::Off | SoundStatus::Connecting => None,
+    }
+}
+
 fn display_name(monitor: &Monitor) -> String {
     let name = if monitor.name.trim().is_empty() {
         format!("Display {}", monitor.id)
@@ -805,6 +876,7 @@ mod tests {
             sent_events: 0,
             received_events: 0,
             last_error: String::new(),
+            sound: Default::default(),
         };
         let local = [display(7)];
         let gone = |link: &LinkStatus| gone_displays(Some(link), &local);

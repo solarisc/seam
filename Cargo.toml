@@ -24,6 +24,9 @@ anyhow = "1.0"
 bincode = "1.3"
 blake3 = "1.8"
 clipboard-rs = "0.3.5"
+# Records a controlled computer's sound and plays it on the controlling one.
+# `realtime` runs the audio threads at real-time priority (MMCSS on Windows).
+cpal = { version = "0.18.2", features = ["realtime"] }
 crossbeam-channel = "0.5"
 data-encoding = "2.9"
 dirs = "6.0"
@@ -34,6 +37,8 @@ env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rand = "0.8"
 rdev = { version = "0.5.3", features = ["serialize", "unstable_grab"] }
+# Matches the two computers' sample rates and audio clocks.
+rubato = { version = "5.0.1", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.21"

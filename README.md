@@ -19,6 +19,9 @@ open source and works over your local network.
   up to four others, one on each screen edge.
 - **Clipboard, images and files.** Copy on one computer, paste on another.
   Large files stream in the background without slowing the pointer.
+- **Sound.** Hear a computer you control through the speakers or headphones
+  of the one you're using: lossless stereo, a few hundredths of a second
+  behind.
 - **Mac and Windows shortcuts.** Command and Control are swapped
   automatically, so copy and paste work as you expect on both.
 - **Windows sign-in and lock screens.** Type your Windows password from the
@@ -133,6 +136,22 @@ are skipped, and copying something new stops a large copy still on its way.
 The computer receiving files needs as much free disk space as they take,
 plus 1 GB.
 
+### Sound
+
+On the **Screens** page, turn on **Play its sound here** under a computer you
+control, and what it plays comes out of the speakers or headphones of the
+computer you're using. The switch takes effect at once and is remembered.
+Seam records that computer's sound only while the switch is on, and sends it
+uncompressed (16-bit stereo at its own sample rate) only while something
+plays. It arrives a few hundredths of a second later and stays in step over
+hours, and Seam follows a change of speakers on either computer. The other
+computer keeps playing its sound itself too; on some computers its volume
+setting also changes how loud it plays here.
+
+A Mac shares its sound on macOS 14.6 or later. The first time, macOS asks
+whether Seam may record the computer's audio; allow it under **System
+Settings → Privacy & Security → Screen & System Audio Recording**.
+
 ### Sleep and wake
 
 A computer that has gone to sleep can't take the pointer. Two settings
@@ -192,8 +211,9 @@ then delete `~/Library/LaunchAgents/dev.seam.agent.plist` and
 ## Troubleshooting
 
 **A computer doesn't appear or won't connect.** Both computers must be on the
-same network and running Seam. Seam uses TCP ports 47843–47846 and UDP
-port 47846, and on Windows also TCP 47853–47855 for the sign-in screen. The
+same network and running Seam. Seam uses TCP ports 47843–47847 and UDP
+port 47846, and on Windows also TCP 47853–47855 and 47857 for the sign-in
+screen. The
 Windows installer allows these on the local network; if you use another
 firewall, allow Seam there. On macOS, allow Seam under
 **Privacy & Security → Local Network** if asked.
@@ -211,6 +231,11 @@ version; install the latest on each. Remote Desktop moves a Windows session
 off the computer's own screen, and Seam can't reach it there until someone
 signs in at that screen again, so avoid Remote Desktop to a computer you use
 through Seam.
+
+**No sound from a computer.** The line under **Play its sound here** says
+why. Both computers need a version of Seam that shares sound. A Mac needs
+Seam allowed under **Privacy & Security → Screen & System Audio Recording**;
+without it, macOS gives Seam silence.
 
 **The pointer doesn't move on a Mac.** Check that Seam is on under
 **Privacy & Security → Accessibility**. If you rebuilt Seam from source,

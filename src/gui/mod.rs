@@ -93,6 +93,8 @@ enum Outcome {
     Saved(Box<Config>, String),
     Done(String),
     Layout,
+    /// The agent saved a change the window already shows; read it back.
+    Reload,
 }
 
 struct Task {
@@ -311,6 +313,44 @@ impl App {
         }
     }
 
+    /// Play controlled computer `index`'s sound here, or stop: at once
+    /// through the agent while sharing is on, otherwise saved for next time.
+    fn set_sound(&mut self, index: usize, on: bool) {
+        if self.task.is_some() {
+            return;
+        }
+        let Some(code) = self.config.peers.get(index).map(|peer| peer.code.clone()) else {
+            return;
+        };
+        // The switch moves at once; a failure puts it back.
+        for config in [&mut self.config, &mut self.draft] {
+            if let Some(peer) = config.peers.get_mut(index) {
+                peer.sound = on;
+            }
+        }
+        let (config, running) = (self.config.clone(), self.running());
+        self.spawn(
+            if on {
+                "Turning sound on…"
+            } else {
+                "Turning sound off…"
+            },
+            move || {
+                if running {
+                    status::agent(&config).set_sound(index, on)?;
+                } else {
+                    crate::config::edit(|saved| {
+                        if let Some(peer) = saved.peers.iter_mut().find(|peer| peer.code == code) {
+                            peer.sound = on;
+                        }
+                        Ok(())
+                    })?;
+                }
+                Ok(Outcome::Reload)
+            },
+        );
+    }
+
     fn pair(&mut self, name: &str, address: &str, port: u16) {
         let (events_tx, events) = crossbeam_channel::unbounded();
         let cancel = Arc::new(Signal::default());
@@ -416,9 +456,14 @@ impl App {
                             }
                             self.notify("Arrangement updated on both computers", Tone::Info);
                         }
+                        Ok(Outcome::Reload) => self.config_stamp = None,
                         // Shown as a lasting banner rather than a toast.
                         Err(error) if starting => log::error!("starting sharing failed: {error}"),
-                        Err(error) => self.notify(error, Tone::Error),
+                        Err(error) => {
+                            self.notify(error, Tone::Error);
+                            // Undo whatever the window showed ahead of the change.
+                            self.config_stamp = None;
+                        }
                     }
                 }
                 Err(TryRecvError::Disconnected) => self.task = None,

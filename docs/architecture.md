@@ -33,18 +33,19 @@ All ports derive from `listen_port` (default 47843):
 | `+2` (TCP, localhost) | Commands from the settings window and tray |
 | `+3` (TCP) | Pairing requests |
 | `+3` (UDP) | Discovery beacons |
+| `+4` (TCP) | A controlled computer's sound, bound to the input session |
 
-Input and clipboard use separate connections so a large copy never delays the
-pointer. Both are encrypted with the Noise `NNpsk0` pattern keyed by the
-receiving computer's 128-bit pairing secret. `NNpsk0`'s first message can be
+Input, clipboard and sound use separate connections so a large copy never
+delays the pointer or the sound. All are encrypted with the Noise `NNpsk0`
+pattern keyed by the receiving computer's 128-bit pairing secret. `NNpsk0`'s first message can be
 replayed by anyone who recorded it, so the connecting computer follows the
 handshake with a message encrypted under the new session key, and the
 receiving computer accepts the connection only once that decrypts
 (`network.rs`). Each handshake must finish within 3 seconds as a whole,
 whatever the pace of individual reads.
 
-The Windows sign-in helper (below) uses `listen_port + 10` to `+ 12` in the
-same way.
+The Windows sign-in helper (below) uses `listen_port + 10` to `+ 12` and
+`+ 14` in the same way.
 
 ## Pairing
 
@@ -89,6 +90,33 @@ Pointer motion is coalesced, never delayed: only positions already waiting
 are merged. Keys, buttons and scrolls keep their order. When control returns
 or a connection drops, held keys and buttons are released on the computer
 that received them.
+
+## Sound
+
+While **Play its sound here** is on for a controlled computer, the
+controlling computer keeps a connection open to that computer's sound port,
+bound to the input session like the clipboard's (`sound/mod.rs`). The switch
+is a live command to the agent, which also saves it; no restart is needed.
+The controlled computer records its default output device only while that
+connection is open (`sound/capture.rs`): WASAPI loopback on Windows, a Core
+Audio process tap on macOS 14.6 and later. It folds the recording to stereo,
+rounds it to 16 bits with triangular dither and sends it at its own sample
+rate in the buffers the system delivers, about 10 ms each. After 250 ms of
+silence it sends a pause and nothing more until sound returns. The Windows
+sign-in helper answers on its sound port that the computer is locked.
+
+The controlling computer plays through its default output device
+(`sound/playback.rs`). Samples wait in a buffer that starts at 25 ms beyond
+what the speakers first ask for, grows by 10 ms whenever it runs dry and
+shrinks by 5 ms, down to 15 ms, after a while without; that while doubles each
+time it runs dry. The speakers' callback converts in 128-frame steps: a
+crossfaded frame slip when both computers use the same rate, a sinc
+resampler otherwise. It leans the rate by up to 0.5 % to hold the buffer at
+its target, which follows the drift between the two audio clocks. The
+speakers close after 30 seconds of quiet and reopen with the next sound;
+either computer follows a change of default device within a second. Sound
+threads run at the same raised priority as input's, and the audio callbacks
+at real-time priority.
 
 ## Windows sign-in and lock screens
 

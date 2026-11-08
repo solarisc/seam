@@ -109,6 +109,9 @@ pub struct Peer {
     /// was awake, for waking it from sleep. An unreadable one is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// Play this computer's sound here.
+    #[serde(default)]
+    pub sound: bool,
 }
 
 impl Peer {
@@ -598,6 +601,7 @@ mod tests {
             code: random_secret(),
             arrangement: Arrangement::on(side),
             mac: None,
+            sound: false,
         }
     }
 

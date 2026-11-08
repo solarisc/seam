@@ -8,6 +8,7 @@ use crate::{
     protocol::{Input, PROTOCOL_VERSION, monitors},
     session,
     shutdown::Signal,
+    sound,
     status::{self, LinkHandle, NearbyPeer, Stats, Status},
     wake,
 };
@@ -70,6 +71,7 @@ struct LinkContext {
     stats: Arc<Stats>,
     layouts: Arc<layout::Service>,
     sessions: Arc<session::Control>,
+    sound: Arc<sound::Link>,
 }
 
 pub fn run(mut config: Config) -> Result<()> {
@@ -140,6 +142,7 @@ pub fn run(mut config: Config) -> Result<()> {
                     controller.clone(),
                     path.clone(),
                 ),
+                sound: sound::Link::new(link.remote().is_some_and(|peer| peer.sound)),
                 link,
                 controller,
                 stats: Stats::new(),
@@ -159,6 +162,7 @@ pub fn run(mut config: Config) -> Result<()> {
                 controller: context.controller.clone(),
                 layouts: context.layouts.clone(),
                 beacon: beacon.clone(),
+                sound: context.sound.clone(),
             })
             .collect(),
     );
@@ -214,6 +218,8 @@ pub fn run(mut config: Config) -> Result<()> {
         } else {
             let (data, data_status) = (context.clone(), status.clone());
             thread::spawn(move || listen_data(data, &data_status));
+            let (sound, sound_status) = (context.clone(), status.clone());
+            thread::spawn(move || listen_sound(sound, &sound_status, sign_in_helper));
             let status = status.clone();
             thread::spawn(move || listen_input(context, &status));
         }
@@ -392,6 +398,46 @@ fn listen_data(context: LinkContext, status: &Status) {
             })();
             if let Err(e) = result {
                 log::info!("clipboard session ended: {e:#}");
+            }
+        });
+    }
+}
+
+/// Accept the controlling computer's sound connection, and record and send
+/// this computer's sound while it stays open. The Windows sign-in screen has
+/// no sound of the person's to share, and says so.
+fn listen_sound(context: LinkContext, status: &Status, sign_in_screen: bool) {
+    let port = context.link.config.listen_port + sound::PORT_OFFSET;
+    let listener = match TcpListener::bind(("0.0.0.0", port)) {
+        Ok(v) => v,
+        Err(e) => {
+            // Keyboard, mouse and clipboard work on without it.
+            let problem = crate::ports::unavailable(port, crate::ports::Protocol::Tcp, &e);
+            log::warn!("this computer's sound can't be shared: {problem}");
+            status.report_problem(&problem);
+            return;
+        }
+    };
+    let admission = Admission::new(HANDSHAKE_LIMIT);
+    for accepted in listener.incoming() {
+        let Ok(socket) = accepted else {
+            continue;
+        };
+        let Some(admitted) = admission.enter() else {
+            continue;
+        };
+        let code = context.link.config.pair_code.clone();
+        let (sessions, link) = (context.sessions.clone(), context.sound.clone());
+        thread::spawn(move || {
+            let result = (|| {
+                let conn = SecureConnection::accept(socket, &code);
+                drop(admitted);
+                let (reader, writer, lease) = sessions.accept(conn?, session::Channel::Sound)?;
+                sound::serve(reader, writer, lease.stop.clone(), link, sign_in_screen)
+            })();
+            match result {
+                Ok(()) => log::info!("sound sharing stopped"),
+                Err(e) => log::info!("sound sharing ended: {e:#}"),
             }
         });
     }
@@ -684,6 +730,7 @@ fn input_session(conn: SecureConnection, context: &LinkContext) -> Result<()> {
         stats,
         layouts,
         sessions,
+        sound,
     } = context;
     let config = &link.config;
     #[cfg(target_os = "macos")]
@@ -699,13 +746,18 @@ fn input_session(conn: SecureConnection, context: &LinkContext) -> Result<()> {
     };
     let peer_address = conn.peer_addr()?.to_string();
     let binding = conn.binding();
-    let data_target = if link.connects() {
+    // Clipboard and sound use the ports after the one input reached, which
+    // may be the Windows sign-in screen's rather than the computer's own.
+    let beside_input = |offset: u16| -> Result<Option<SocketAddr>> {
+        if !link.connects() {
+            return Ok(None);
+        }
         let mut address = conn.peer_addr()?;
-        address.set_port(address.port().checked_add(1).context("invalid data port")?);
-        Some(address)
-    } else {
-        None
+        address.set_port(address.port().checked_add(offset).context("invalid port")?);
+        Ok(Some(address))
     };
+    let data_target = beside_input(1)?;
+    let sound_target = beside_input(sound::PORT_OFFSET)?;
     let (mut reader, mut writer) = conn.split()?;
     let queue = Arc::new(InputQueue::new());
     let ping_time = Arc::new(Mutex::new(None::<(u64, Instant)>));
@@ -832,6 +884,18 @@ fn input_session(conn: SecureConnection, context: &LinkContext) -> Result<()> {
                         .unwrap_or_default();
                     let signals = clipboard::InputSignals::new(controller.clone(), stats.clone());
                     thread::spawn(move || connect_data(address, config, code, lease, signals));
+                }
+                // The controlled computer's sound, played here while it's on.
+                if let (Some(address), Some(peer)) = (sound_target, link.remote())
+                    && !sessions.data_lingering()
+                {
+                    let lease = match sessions.reserve(binding, session::Channel::Sound) {
+                        Ok(lease) => lease,
+                        Err(error) => break Err(error),
+                    };
+                    let (sound, code, name) =
+                        (sound.clone(), peer.code.clone(), peer.label().to_string());
+                    thread::spawn(move || sound::play(sound, lease, address, code, name));
                 }
             }
             Input::Layout(control) => {
@@ -1032,6 +1096,7 @@ mod tests {
             controller,
             stats: Stats::new(),
             layouts,
+            sound: sound::Link::new(false),
         }
     }
 
@@ -1051,6 +1116,7 @@ mod tests {
                     code: satellite.pair_code.clone(),
                     arrangement: crate::config::Arrangement::on(side),
                     mac: None,
+                    sound: false,
                 })
                 .collect(),
             ..Config::default()
@@ -1134,6 +1200,7 @@ mod tests {
             code: crate::config::random_secret(),
             arrangement: Default::default(),
             mac: None,
+            sound: false,
         };
         let found = |address: &str, code: &str| NearbyPeer {
             name: "PC".into(),
@@ -1168,6 +1235,7 @@ mod tests {
                 code: crate::config::random_secret(),
                 arrangement: Default::default(),
                 mac: None,
+                sound: false,
             }],
             ..Config::default()
         });
@@ -1198,6 +1266,7 @@ mod tests {
                 controller,
                 layouts,
                 beacon: Some((hint.clone(), alarm.clone())),
+                sound: sound::Link::new(false),
             }],
         );
         let shutdown = Arc::new(Signal::default());
@@ -1344,6 +1413,7 @@ mod tests {
                 stats: self.stats[side].clone(),
                 layouts: self.layouts[side].clone(),
                 sessions: self.sessions[side].clone(),
+                sound: sound::Link::new(false),
             }
         }
 
@@ -1362,6 +1432,7 @@ mod tests {
                     code: listener.pair_code.clone(),
                     arrangement: Default::default(),
                     mac: None,
+                    sound: false,
                 }],
                 ..Config::default()
             });
@@ -1774,6 +1845,7 @@ mod tests {
                 controller: pair.controllers[0].clone(),
                 layouts: pair.layouts[0].clone(),
                 beacon: None,
+                sound: sound::Link::new(false),
             }],
         );
         let (server_config, sessions) = (config.clone(), pair.sessions[0].clone());

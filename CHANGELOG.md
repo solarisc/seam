@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- **Sound from the computers you control.** Turn on **Play its sound here**
+  under a computer on the **Screens** page to hear it through the speakers
+  or headphones of the computer you're using. The switch works at once,
+  without restarting sharing. Sound is sent uncompressed over its own
+  encrypted connection, only while something plays, and stays in step with
+  a delay of a few hundredths of a second. Both computers need this version.
+  A Mac shares its sound on macOS 14.6 or later, once it's allowed under
+  **Privacy & Security → Screen & System Audio Recording**.
+
 ### Fixed
 
 - **A Mac now notices display changes.** Seam on a Mac kept describing the
