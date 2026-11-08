@@ -15,9 +15,9 @@ use anyhow::Result;
 use rubato::{Adjustable, FixedAsync, audioadapter_buffers::direct::InterleavedSlice};
 use std::time::Instant;
 
-/// Frames converted at a time: under 1.5 ms at 48 kHz, so little waits for a
-/// whole step.
-const CHUNK: usize = 64;
+/// Frames converted at a time: well under 1 ms at 48 kHz, so little waits for
+/// a whole step, and none at all of a 10 ms packet.
+const CHUNK: usize = 32;
 
 /// The speakers' buffer, which plays on by itself and plays silence when it
 /// runs out.
@@ -43,24 +43,58 @@ pub(super) trait Speaker {
 /// How close packets come to the speakers taking sound. A packet that
 /// arrives just before a take misses it when it comes a little late, so only
 /// then must a packet be held in reserve. Holding starts as soon as a packet
-/// comes within 2 ms of a take, and ends once every packet for 30 s has kept
-/// more than 3 ms clear, so the delay doesn't swing back and forth.
-#[derive(Default)]
+/// comes within 2 ms of a take, and ends once every packet for 5 minutes has
+/// kept more than 3 ms clear: some devices deliver a packet late only every
+/// minute or two, and the delay shouldn't swing back and forth.
+///
+/// A packet that comes late enough to miss its take seems to arrive early for
+/// the next one, so time to spare is also counted from where packets usually
+/// arrive: one that missed its take has less than none.
 struct Arrivals {
+    /// Where in the speakers' period packets usually arrive, as time to spare.
+    usual: Option<f64>,
     /// The least time to spare this look, and in each recent look.
-    closest: Option<usize>,
-    looks: [Option<usize>; 15],
+    closest: Option<isize>,
+    looks: [Option<isize>; Arrivals::LOOKS],
     seen: usize,
     clear: bool,
 }
 
+impl Default for Arrivals {
+    fn default() -> Self {
+        Self {
+            usual: None,
+            closest: None,
+            looks: [None; Self::LOOKS],
+            seen: 0,
+            clear: false,
+        }
+    }
+}
+
 impl Arrivals {
+    /// Looks that must all be clear before the reserve is let go: 5 minutes.
+    const LOOKS: usize = 150;
     /// Packets seen per look: 2 s of 10 ms packets.
     const PER_LOOK: usize = 200;
+    /// How quickly the usual time to spare follows the packets.
+    const FOLLOW: f64 = 1.0 / 64.0;
 
-    /// A packet arrived `spare` frames before the speakers take sound, at
-    /// `rate`. True while no packet need be held in reserve.
-    fn saw(&mut self, spare: usize, rate: u32) -> bool {
+    /// A packet arrived `spare` frames before the speakers take sound, which
+    /// they do every `period` frames at `rate`. True while no packet need be
+    /// held in reserve.
+    fn saw(&mut self, spare: usize, period: usize, rate: u32) -> bool {
+        let period = period.max(1) as f64;
+        let usual = *self.usual.get_or_insert(spare as f64);
+        // How much earlier than usual this packet came. Packets come late far
+        // more than early, so up to a fifth of a period early counts as early,
+        // and anything else as late.
+        let early = period / 5.0;
+        let off = (spare as f64 - usual + period - early).rem_euclid(period) - (period - early);
+        self.usual = Some((usual + off * Self::FOLLOW).rem_euclid(period));
+        // Coming earlier than usual is as close when it catches an earlier
+        // take: the next packet, on time, then misses its own.
+        let spare = ((usual + off).round() as isize).min(spare as isize);
         let closest = self.closest.map_or(spare, |closest| closest.min(spare));
         self.closest = Some(closest);
         self.seen += 1;
@@ -69,7 +103,7 @@ impl Arrivals {
             self.looks[0] = self.closest.take();
             self.seen = 0;
         }
-        let (near, far) = (rate as usize / 500, rate as usize / 333);
+        let (near, far) = (rate as isize / 500, rate as isize / 333);
         if self.clear {
             self.clear = closest >= near;
         } else {
@@ -290,9 +324,13 @@ impl<S: Speaker> Push<S> {
         self.write_input()?;
         let output_rate = self.speakers_rate();
         let clear = match self.speaker.as_mut().and_then(Speaker::next_take) {
-            Some((spare, _)) => {
-                self.pacing.takes_known();
-                self.arrivals.saw(spare, output_rate)
+            Some((spare, period)) => {
+                // The period in the sender's frames.
+                let source_period = (period as f64 * f64::from(self.pacing.rate())
+                    / f64::from(output_rate.max(1)))
+                .round() as usize;
+                self.pacing.takes_known(source_period);
+                self.arrivals.saw(spare, period, output_rate)
             }
             None => {
                 self.arrivals = Arrivals::default();
@@ -344,6 +382,10 @@ impl<S: Speaker> Push<S> {
         speaker.write(&self.mapped)
     }
 }
+
+#[cfg(test)]
+#[path = "push_eval.rs"]
+mod eval;
 
 #[cfg(test)]
 mod tests {
@@ -535,11 +577,24 @@ mod tests {
     #[test]
     fn packets_clear_of_the_takes_need_no_packet_in_reserve() {
         // Packets arrive 4 ms before the speakers take sound.
-        let (device, push, mean) = run_on(telling(3), 1.0, 0, 120, true);
+        let (device, push, mean) = run_on(telling(3), 1.0, 0, 420, true);
         assert_eq!(device.lock().unwrap().short, 0);
         let delay = push.pacing().delay();
         assert!(delay < Duration::from_millis(8), "{delay:?}");
         assert!(mean < 12.0, "{mean:.1} ms waiting");
+    }
+
+    #[test]
+    fn a_packet_that_misses_its_take_counts_as_close() {
+        let mut arrivals = Arrivals::default();
+        // Packets 5 ms before each take, long enough to let the reserve go.
+        for _ in 0..Arrivals::PER_LOOK * (Arrivals::LOOKS + 1) {
+            arrivals.saw(240, 480, 48_000);
+        }
+        assert!(arrivals.clear);
+        // One comes 5.5 ms late: it missed its take, and seems 9.5 ms early
+        // for the next.
+        assert!(!arrivals.saw(456, 480, 48_000), "holds a packet again");
     }
 
     #[test]
@@ -553,7 +608,11 @@ mod tests {
                 0,
                 "ran short taking at {takes_at}"
             );
-            assert!(push.pacing().delay() >= Duration::from_millis(10));
+            let delay = push.pacing().delay();
+            assert!(
+                delay >= Duration::from_millis(9),
+                "{delay:?} taking at {takes_at}"
+            );
         }
     }
 
@@ -580,8 +639,8 @@ mod tests {
         push.pause();
         let target = push.pacing().target();
         let queued = device.lock().unwrap().queue.len() / 2;
-        // Silence up to the target, then all 100 frames, padded to two steps.
-        assert_eq!(queued, target + 2 * CHUNK);
+        // Silence up to the target, then all 100 frames, padded to whole steps.
+        assert_eq!(queued, target + 100usize.next_multiple_of(CHUNK));
         let samples: Vec<f32> = device.lock().unwrap().queue.iter().copied().collect();
         let heard = samples.iter().filter(|sample| sample.abs() > 0.0).count();
         assert!(heard >= 2 * 90, "{heard}");

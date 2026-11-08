@@ -38,8 +38,14 @@ const MARGIN: Duration = Duration::from_millis(4);
 /// a whole period at a time, so a late packet needs the reserve, a whole
 /// packet; the margin then only absorbs packets of uneven size and the
 /// leaning of the rate.
+/// There a wider margin helps little, so running dry widens it less, and it
+/// narrows again sooner: the target's own growth covers the gap.
 #[cfg(any(windows, test))]
-const TIMED_MARGIN: Duration = Duration::from_millis(1);
+const TIMED_MARGIN: Duration = Duration::from_millis(2);
+#[cfg(any(windows, test))]
+const TIMED_WIDER: Duration = Duration::from_millis(1);
+#[cfg(any(windows, test))]
+const TIMED_NARROW_AFTER: u32 = 30;
 const WIDER: Duration = Duration::from_millis(3);
 const MOST_MARGIN: Duration = Duration::from_millis(40);
 const NARROW_AFTER: u32 = 150;
@@ -73,8 +79,11 @@ pub(super) struct Pacing {
     rate: u32,
     target: usize,
     margin: usize,
-    /// The narrowest the margin gets.
+    /// The narrowest the margin gets, how much running dry widens it, and the
+    /// looks without running dry before it narrows by 1 ms.
     least_margin: usize,
+    wider: usize,
+    narrow_after: u32,
     /// Since the last look: the fewest frames left, and the sum and count of
     /// fills, for their mean.
     lowest: usize,
@@ -92,6 +101,8 @@ pub(super) struct Pacing {
     typicals: [usize; LOOKS_REMEMBERED],
     /// The most frames that have arrived at once.
     largest_packet: usize,
+    /// The frames the speakers take at a time, when they tell.
+    period: Option<usize>,
     /// Frames played since the last look.
     window: usize,
     /// Looks since the buffer last ran dry.
@@ -108,6 +119,8 @@ impl Pacing {
             target: 0,
             margin: 0,
             least_margin: 0,
+            wider: 0,
+            narrow_after: NARROW_AFTER,
             lowest: usize::MAX,
             fills: 0,
             takes: 0,
@@ -117,6 +130,7 @@ impl Pacing {
             low_count: 0,
             typicals: [0; LOOKS_REMEMBERED],
             largest_packet: 0,
+            period: None,
             window: 0,
             calm: 0,
             reserve: true,
@@ -125,20 +139,31 @@ impl Pacing {
         pacing.target = pacing.frames_in(START_DELAY);
         pacing.margin = pacing.frames_in(MARGIN);
         pacing.least_margin = pacing.margin;
+        pacing.wider = pacing.frames_in(WIDER);
         pacing
     }
 
-    /// The speakers tell when they take sound: keep the narrower margin that
-    /// allows (see `TIMED_MARGIN`). A margin already widened by running dry
-    /// stays as wide.
+    /// The speakers tell when they take sound, `period` frames at a time:
+    /// keep the narrower margin that allows (see `TIMED_MARGIN`), and hold
+    /// one period in reserve, however much arrives at once. A margin already
+    /// widened by running dry stays as wide.
     #[cfg(any(windows, test))]
-    pub(super) fn takes_known(&mut self) {
+    pub(super) fn takes_known(&mut self, period: usize) {
+        self.period = Some(period.max(1));
         let timed = self.frames_in(TIMED_MARGIN);
         if self.least_margin != timed {
             if self.margin == self.least_margin {
                 self.margin = timed;
             }
             self.least_margin = timed;
+            // Start from a packet in reserve and the margin, not the
+            // general starting delay; the target grows at once if short.
+            self.target = self
+                .target
+                .min(self.held() + 2 * timed)
+                .max(self.frames_in(MIN_DELAY));
+            self.wider = self.frames_in(TIMED_WIDER);
+            self.narrow_after = TIMED_NARROW_AFTER;
         }
     }
 
@@ -168,6 +193,11 @@ impl Pacing {
         self.largest_packet = self.largest_packet.max(frames);
     }
 
+    /// The frames held in reserve while a packet is.
+    fn held(&self) -> usize {
+        self.period.unwrap_or(self.largest_packet)
+    }
+
     /// The speakers have just taken what they need; `fill` frames remain.
     pub(super) fn low_point(&mut self, fill: usize) {
         if self.low_count < self.low_points.len() {
@@ -182,7 +212,7 @@ impl Pacing {
         if hold && !self.reserve {
             self.target = self
                 .target
-                .max(self.largest_packet + self.margin)
+                .max(self.held() + self.margin)
                 .min(self.frames_in(MAX_DELAY));
             self.lows = [0; LOOKS_REMEMBERED];
             self.typicals = [0; LOOKS_REMEMBERED];
@@ -193,7 +223,7 @@ impl Pacing {
     pub(super) fn ran_dry(&mut self) {
         self.underruns += 1;
         self.target = (self.target + self.frames_in(LONGER)).min(self.frames_in(MAX_DELAY));
-        self.margin = (self.margin + self.frames_in(WIDER)).min(self.frames_in(MOST_MARGIN));
+        self.margin = (self.margin + self.wider).min(self.frames_in(MOST_MARGIN));
         self.calm = 0;
         self.last_mean = None;
         self.lows = [0; LOOKS_REMEMBERED];
@@ -232,7 +262,7 @@ impl Pacing {
         } else {
             lowest
         };
-        let packet = if self.reserve { self.largest_packet } else { 0 };
+        let packet = if self.reserve { self.held() } else { 0 };
         let (margin, reserve) = (self.margin, packet + self.margin);
         // Shorten only on what the last several looks all allow: a dip that
         // comes now and then must not be forgotten between two looks.
@@ -254,7 +284,7 @@ impl Pacing {
                 .max(self.frames_in(MIN_DELAY));
         }
         self.calm += 1;
-        if self.calm >= NARROW_AFTER {
+        if self.calm >= self.narrow_after {
             self.calm = 0;
             self.margin = self
                 .margin
@@ -332,14 +362,19 @@ mod tests {
     #[test]
     fn speakers_that_tell_their_takes_keep_a_narrower_margin() {
         let mut pacing = Pacing::new(48_000);
-        pacing.takes_known();
-        assert_eq!(pacing.margin, 48);
+        pacing.takes_known(480);
+        assert_eq!(pacing.margin, 96);
         pacing.ran_dry();
-        pacing.takes_known();
-        assert_eq!(pacing.margin, 48 + 144, "a widened margin stays wide");
+        pacing.takes_known(480);
+        assert_eq!(pacing.margin, 96 + 48, "widens by 1 ms, and stays wide");
+        for _ in 0..TIMED_NARROW_AFTER {
+            pacing.window = pacing.frames_in(LOOK_EVERY);
+            pacing.played(0, pacing.target);
+        }
+        assert_eq!(pacing.margin, 96, "narrows again a minute later");
         let mut pacing = Pacing::new(48_000);
         pacing.ran_dry();
-        pacing.takes_known();
+        pacing.takes_known(480);
         assert_eq!(
             pacing.margin,
             192 + 144,

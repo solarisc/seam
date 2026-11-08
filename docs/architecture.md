@@ -141,12 +141,16 @@ the buffer runs dry.
 A packet is held in reserve only because one that arrives just before the
 speakers take sound misses that take when it comes a little late. On
 Windows the speakers' clock tells when they next take sound, so each packet's
-time to spare is known: the reserve is held as soon as a packet comes within
-2 ms of a take, and let go once every packet for 30 seconds has kept more
-than 3 ms clear, which saves one speaker period (usually 10 ms). The two
-clocks drift, so this changes over minutes. The speakers take a whole period
-at a time, so the reserve is what covers a late packet, and the margin there
-starts at 1 ms, only for packets of uneven size and the leaning of the rate.
+time to spare is known. It is counted from where packets usually arrive, so
+one late enough to miss its take counts as having less than none, rather
+than as early for the next. The reserve is held as soon as a packet comes
+within 2 ms of a take, and let go once every packet for 5 minutes has kept
+more than 3 ms clear (some devices deliver a packet late only every minute
+or two), which saves one speaker period (usually 10 ms). The two clocks
+drift, so this changes over minutes. The speakers take a whole period at a
+time, so the reserve is one period, however much arrives at once, and the
+margin there starts at 2 ms, only for packets of uneven size and the leaning
+of the rate; running dry widens it by 1 ms, for a minute.
 On a steady wired network between two Windows computers, sound plays here
 about 15 ms after it plays there while a packet is held in reserve, and
 sooner while packets fall clear of the takes.
