@@ -1,8 +1,5 @@
 //! Match physical displays across Windows sessions. HMONITOR is only a runtime handle.
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::collections::BTreeMap;
 use windows_sys::Win32::{
     Foundation::{LPARAM, RECT},
     Graphics::Gdi::{
@@ -64,34 +61,6 @@ pub(crate) fn layout() -> Option<Vec<Placement>> {
         .collect()
 }
 
-/// Even with the layout unchanged, read the displays in full this often: a
-/// display swapped for another of the same size on the same port changes
-/// only its identity.
-const FULL_READ: Duration = Duration::from_secs(30);
-
-/// When the display watcher must read the displays in full.
-#[derive(Default)]
-pub(crate) struct LayoutWatch {
-    /// The layout at the last successful full read, and when.
-    read: Option<(Vec<Placement>, Instant)>,
-}
-
-impl LayoutWatch {
-    pub(crate) fn needs_read(&self, layout: Option<&Vec<Placement>>, now: Instant) -> bool {
-        match (&self.read, layout) {
-            (Some((seen, at)), Some(layout)) => {
-                seen != layout || now.duration_since(*at) >= FULL_READ
-            }
-            _ => true,
-        }
-    }
-
-    /// A full read succeeded with `layout` in place.
-    pub(crate) fn read(&mut self, layout: Option<Vec<Placement>>, now: Instant) {
-        self.read = layout.map(|layout| (layout, now));
-    }
-}
-
 pub(crate) fn identity(device_name: &str) -> Option<String> {
     let name: Vec<u16> = device_name.encode_utf16().chain(Some(0)).collect();
     let mut identities = Vec::new();
@@ -132,29 +101,6 @@ pub(crate) fn identities() -> anyhow::Result<BTreeMap<u32, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn display(left: i32) -> Placement {
-        ([left, 0, left + 1920, 1080], 0, [0; 32])
-    }
-
-    #[test]
-    fn a_full_read_follows_a_layout_change_or_time() {
-        let start = Instant::now();
-        let mut watch = LayoutWatch::default();
-        let two = vec![display(0), display(1920)];
-        assert!(watch.needs_read(Some(&two), start), "nothing read yet");
-        watch.read(Some(two.clone()), start);
-        assert!(!watch.needs_read(Some(&two), start + Duration::from_secs(1)));
-        // A display unplugged or moved, or the layout unreadable: read now.
-        assert!(watch.needs_read(Some(&vec![display(0)]), start + Duration::from_secs(1)));
-        assert!(watch.needs_read(Some(&vec![display(0), display(-1920)]), start));
-        assert!(watch.needs_read(None, start));
-        // Unchanged, but a display may have been swapped for an identical one.
-        assert!(watch.needs_read(Some(&two), start + FULL_READ));
-        // A failed full read records nothing, so the next look reads again.
-        watch.read(None, start);
-        assert!(watch.needs_read(Some(&two), start + Duration::from_secs(1)));
-    }
 
     #[test]
     fn the_layout_lists_every_display() {

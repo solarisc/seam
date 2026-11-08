@@ -109,6 +109,13 @@ When either computer has several displays, choose which display each edge
 belongs to under the computer's name on the **Screens** page. Selections are
 remembered across restarts and monitor changes.
 
+Seam follows display changes within a second, such as plugging a monitor
+into a laptop, closing its lid or changing a resolution. If the display an
+edge belongs to is disconnected, the computer shows **Selected display is no
+longer available** and its picker shows **Disconnected display**. Choose
+another display there, or **Main display**. Seam never moves an edge to a
+display on its own.
+
 ### Keyboard shortcuts
 
 With **Swap Command and Control** on (the default), Command shortcuts on a Mac

@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A Mac now notices display changes.** Seam on a Mac kept describing the
+  displays it had when it started. After a monitor was plugged in or the lid
+  was closed, the pointer arriving from another computer was held to the old
+  display's size. Parts of the screen, such as the Dock, were out of reach,
+  and the pointer crossed back before reaching the edge. Seam waited for
+  macOS to announce the change, which some versions never do. Every computer
+  now checks its displays each second and reconnects with the new layout
+  within a second of a change. Update Seam on the Mac to get this fix.
+- **A display that's gone can be replaced from the Screens page.** When the
+  display an edge belonged to was disconnected and the computer had only one
+  display left, the display picker stayed hidden, leaving **Selected display
+  is no longer available** with nothing to choose. The picker now appears
+  whenever the chosen display is gone, showing **Disconnected display**.
+  Choose a display there, or **Main display**.
+
 ## 1.0.0
 
 The first release of Seam: one keyboard, mouse and clipboard across your

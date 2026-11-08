@@ -65,7 +65,9 @@ impl Layout {
                     .find(|m| m.primary)
                     .or_else(|| monitors.first()),
             }
-            .ok_or_else(|| anyhow::anyhow!("Selected display is no longer available"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Selected display is no longer available; choose another")
+            })?;
             ensure!(
                 monitor.width > 0 && monitor.height > 0,
                 "Invalid display size"

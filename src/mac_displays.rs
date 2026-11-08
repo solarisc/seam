@@ -1,4 +1,5 @@
-//! Stable display selection and event-driven display refresh on macOS.
+//! The displays macOS draws to, their persistent identities, and display
+//! change announcements.
 use anyhow::{Result, ensure};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::{
@@ -6,10 +7,30 @@ use std::{
     ffi::c_void,
     ptr,
     sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
+
+#[repr(C)]
+struct Point {
+    x: f64,
+    y: f64,
+}
+#[repr(C)]
+struct Size {
+    width: f64,
+    height: f64,
+}
+#[repr(C)]
+struct Rect {
+    origin: Point,
+    size: Size,
+}
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
+    fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    fn CGDisplayBounds(display: u32) -> Rect;
+    fn CGDisplayIsMain(display: u32) -> u32;
     fn CGGetOnlineDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> *const c_void;
     fn CGDisplayRegisterReconfigurationCallback(
@@ -27,6 +48,52 @@ unsafe extern "C" {
         encoding: u32,
     ) -> bool;
     fn CFRelease(value: *const c_void);
+}
+
+/// A display macOS draws to, in global display coordinates: points, the
+/// space pointer events use, with the main display's top-left corner at the
+/// origin.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Active {
+    pub(crate) id: u32,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) main: bool,
+}
+
+/// The displays macOS draws to now. CoreGraphics only, so it is safe off the
+/// main thread and cheap enough to call every second. A sleeping display is
+/// not active: while every display sleeps the list is empty.
+pub(crate) fn active() -> Result<Vec<Active>> {
+    let mut count = 0;
+    ensure!(
+        unsafe { CGGetActiveDisplayList(0, ptr::null_mut(), &mut count) } == 0,
+        "Cannot count active displays"
+    );
+    // The inventory can grow between the two calls; the next look picks up
+    // any additional display. The API writes at most the given capacity.
+    let mut displays = vec![0; count as usize];
+    ensure!(
+        unsafe { CGGetActiveDisplayList(count, displays.as_mut_ptr(), &mut count) } == 0,
+        "Cannot read active displays"
+    );
+    displays.truncate(count as usize);
+    Ok(displays
+        .into_iter()
+        .map(|id| {
+            let bounds = unsafe { CGDisplayBounds(id) };
+            Active {
+                id,
+                x: bounds.origin.x as i32,
+                y: bounds.origin.y as i32,
+                width: bounds.size.width as u32,
+                height: bounds.size.height as u32,
+                main: unsafe { CGDisplayIsMain(id) } != 0,
+            }
+        })
+        .collect())
 }
 
 pub(crate) fn identities() -> Result<BTreeMap<u32, String>> {
@@ -83,6 +150,9 @@ extern "C" fn changed(_: u32, flags: u32, _: *mut c_void) {
     }
 }
 
+/// Display change announcements. They speed up noticing a change but cannot
+/// be relied on: some macOS versions accept the subscription and then never
+/// call back, so the displays must also be looked at regularly.
 pub(crate) struct Watch {
     changes: Receiver<()>,
     _shutdown: crate::shutdown::Registration,
@@ -103,7 +173,10 @@ impl Watch {
             _shutdown: registration,
         })
     }
-    pub(crate) fn wait(&self) {
-        let _ = self.changes.recv();
+    /// Waits up to `timeout` for a display change or shutdown, and tells
+    /// whether one arrived. `SUBSCRIBERS` keeps a sender for as long as this
+    /// receiver lives, so the wait never ends early for want of one.
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
+        self.changes.recv_timeout(timeout).is_ok()
     }
 }

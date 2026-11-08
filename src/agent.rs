@@ -232,46 +232,57 @@ pub fn run(mut config: Config) -> Result<()> {
 
 /// Follow display changes; a changed desktop reconnects every link so both
 /// computers exchange fresh geometry.
+///
+/// A cheap look at the layout each second decides whether to read the
+/// displays in full. macOS also announces changes, which are then read at
+/// once, but some versions never deliver the announcement. Waiting for it
+/// alone left a Mac describing the displays it had when Seam started, such as
+/// its built-in screen after an external one took over, with part of the
+/// real screen out of the pointer's reach.
 fn watch_displays(layouts: Vec<Arc<layout::Service>>, shutdown: Arc<Signal>) {
     thread::spawn(move || {
         #[cfg(target_os = "macos")]
         let changes = crate::mac_displays::Watch::new(&shutdown)
             .map_err(|error| {
-                log::warn!("Display notifications unavailable; using periodic refresh: {error:#}");
+                log::warn!("Display change announcements unavailable: {error:#}");
             })
             .ok();
-        // Windows has no display notifications here: a cheap look at the
-        // layout each second decides whether to read the displays in full.
-        #[cfg(target_os = "windows")]
-        let mut watch = crate::windows_displays::LayoutWatch::default();
+        let mut watch = crate::display_watch::LayoutWatch::default();
         while !shutdown.is_stopped() {
+            let now = Instant::now();
             #[cfg(target_os = "windows")]
             let placement = crate::windows_displays::layout();
-            #[cfg(target_os = "windows")]
-            if !watch.needs_read(placement.as_ref(), std::time::Instant::now()) {
-                shutdown.wait(Duration::from_secs(1));
-                continue;
-            }
-            match crate::protocol::monitor_geometry(&layouts[0].local_monitors()) {
-                Ok(displays) => {
-                    #[cfg(target_os = "windows")]
-                    watch.read(placement, std::time::Instant::now());
-                    for layout in &layouts {
-                        layout.update_monitors(displays.clone());
+            #[cfg(target_os = "macos")]
+            let placement = crate::mac_displays::active().ok();
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let placement: Option<()> = None;
+            if watch.needs_read(placement.as_ref(), now) {
+                match crate::protocol::monitor_geometry(&layouts[0].local_monitors()) {
+                    // macOS lists no display while they all sleep. That is no
+                    // desktop to describe: keep the last one, so the pointer
+                    // can still cross to the computer and wake its screen.
+                    Ok(displays) if displays.is_empty() => watch.read(placement, now),
+                    Ok(displays) => {
+                        watch.read(placement, now);
+                        for layout in &layouts {
+                            layout.update_monitors(displays.clone());
+                        }
                     }
-                }
-                Err(error) => {
-                    // Try again in a second, as before, whatever the layout.
-                    #[cfg(target_os = "windows")]
-                    watch.read(None, std::time::Instant::now());
-                    for layout in &layouts {
-                        layout.disconnect(&format!("Cannot read displays: {error}"));
+                    Err(error) => {
+                        // Try again in a second, whatever the layout.
+                        watch.read(None, now);
+                        for layout in &layouts {
+                            layout.disconnect(&format!("Cannot read displays: {error}"));
+                        }
                     }
                 }
             }
             #[cfg(target_os = "macos")]
             if let Some(changes) = &changes {
-                changes.wait();
+                if changes.wait(Duration::from_secs(1)) {
+                    // Announced: read in full even if the layout looks the same.
+                    watch = crate::display_watch::LayoutWatch::default();
+                }
                 continue;
             }
             shutdown.wait(Duration::from_secs(1));
