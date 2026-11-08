@@ -144,7 +144,9 @@ computer you're using. The switch takes effect at once and is remembered.
 Seam records that computer's sound only while the switch is on, and sends it
 uncompressed (16-bit stereo at its own sample rate) only while something
 plays. It arrives a few hundredths of a second later and stays in step over
-hours, and Seam follows a change of speakers on either computer. The other
+hours, and Seam follows a change of speakers on either computer. A Windows
+computer shares what every app plays, whichever speakers or headphones the
+app uses; a Mac shares what plays on its default speakers. The other
 computer keeps playing its sound itself too; on some computers its volume
 setting also changes how loud it plays here.
 

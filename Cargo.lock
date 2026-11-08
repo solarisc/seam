@@ -2884,6 +2884,7 @@ dependencies = [
  "tempfile",
  "walkdir",
  "windows 0.62.2",
+ "windows-core 0.62.2",
  "windows-service",
  "windows-sys 0.61.2",
  "winresource",

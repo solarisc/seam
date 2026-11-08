@@ -9,7 +9,9 @@
   or headphones of the computer you're using. The switch works at once,
   without restarting sharing. Sound is sent uncompressed over its own
   encrypted connection, only while something plays, and stays in step with
-  a delay of a few hundredths of a second. Both computers need this version.
+  a delay of a few hundredths of a second. A Windows computer shares every
+  app's sound, whichever speakers or headphones it plays on. Both computers
+  need this version.
   A Mac shares its sound on macOS 14.6 or later, once it's allowed under
   **Privacy & Security → Screen & System Audio Recording**.
 

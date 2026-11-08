@@ -11,6 +11,11 @@
 //! ever waits for it, nor it for them.
 mod capture;
 mod dsp;
+#[cfg(windows)]
+mod loopback;
+// Windows mixes the devices it records; tested everywhere.
+#[cfg(any(windows, test))]
+mod mix;
 mod pacing;
 // Windows writes sound straight into the speakers' buffer as it arrives;
 // macOS's speakers ask for it. Both are tested everywhere.

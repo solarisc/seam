@@ -97,12 +97,21 @@ While **Play its sound here** is on for a controlled computer, the
 controlling computer keeps a connection open to that computer's sound port,
 bound to the input session like the clipboard's (`sound/mod.rs`). The switch
 is a live command to the agent, which also saves it; no restart is needed.
-The controlled computer records its default output device only while that
-connection is open (`sound/capture.rs`): WASAPI loopback on Windows, a Core
-Audio process tap on macOS 14.6 and later. It folds the recording to stereo,
-rounds it to 16 bits with triangular dither and sends it at its own sample
-rate, as one block of little-endian bytes per buffer the system delivers,
-about 10 ms each. After 250 ms of silence it sends a pause and nothing more
+The controlled computer records only while that connection is open
+(`sound/capture.rs`). On Windows (`sound/loopback.rs`) each app can pick its
+own output device, so every device that plays is recorded through WASAPI
+loopback, which adds no delay, as 48 kHz stereo, and the recordings are mixed
+(`sound/mix.rs`). Each device's level meter, read ten times a second, shows
+which play, and a device stays recorded for a minute after it last played, so
+its next sound starts on time. One device leads: its sound goes out the
+moment it arrives. The others' waits just long enough to be there whenever
+the leader's arrives (one packet of their own and 2 ms), matched to the
+leader's clock by a crossfaded frame slip. Windows can also record every app
+at once (process loopback), but holds that sound back by about 40 ms. A Mac
+records its default output device through a Core Audio process tap on macOS
+14.6 and later, folded to stereo. The recording is rounded to 16 bits with
+triangular dither and sent at its own sample rate, as one block of
+little-endian bytes per buffer the system delivers, about 10 ms each. After 250 ms of silence it sends a pause and nothing more
 until sound returns; while paused, silent buffers are dropped as they are
 recorded. The Windows sign-in helper answers on its sound port that the
 computer is locked.
@@ -128,7 +137,7 @@ packet plus a margin, and that the lowest held the margin. Short of either,
 the target grows at once; with room to spare, and the buffer settled, it
 shrinks by up to 2 ms. The margin starts at 4 ms and widens by 3 ms each time
 the buffer runs dry. On a steady wired network between two Windows
-computers, sound plays here about 30 ms after it plays there.
+computers, sound plays here about 20 ms after it plays there.
 
 After 2 seconds with nothing to play, the speakers pause, which costs
 nothing, and resume when sound arrives; after 10 minutes paused they close.

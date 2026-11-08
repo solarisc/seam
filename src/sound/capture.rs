@@ -1,9 +1,11 @@
 //! Records what this computer plays, for the computer that controls it.
 //!
-//! Windows records the default output device's mix through WASAPI loopback.
-//! macOS 14.6 and later record it through a Core Audio process tap, after the
-//! person allows Seam to record the computer's sound.
+//! Windows records each device that plays and mixes them (see `loopback`).
+//! macOS 14.6 and later record the default speakers' mix through a Core Audio
+//! process tap, after the person allows Seam to record the computer's sound.
+#[cfg(not(windows))]
 use super::dsp;
+#[cfg(not(windows))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender};
 use std::sync::{
@@ -15,10 +17,9 @@ use std::sync::{
 /// falls further behind, newer buffers are dropped until it catches up.
 const QUEUE: usize = 16;
 
-/// Recording of the default output device, delivered as interleaved stereo.
+/// Recording delivered as interleaved stereo.
 pub(super) struct Capture {
-    _stream: cpal::Stream,
-    device: cpal::Device,
+    source: Source,
     pub(super) rate: u32,
     pub(super) packets: Receiver<Vec<f32>>,
     spare: Sender<Vec<f32>>,
@@ -28,6 +29,24 @@ pub(super) struct Capture {
     quiet: Arc<AtomicBool>,
 }
 
+#[cfg(windows)]
+type Source = super::loopback::Recording;
+
+/// The default speakers' mix.
+#[cfg(not(windows))]
+struct Source {
+    _stream: cpal::Stream,
+    device: cpal::Device,
+}
+
+/// What a recording hands its buffers through.
+pub(super) struct Parts {
+    pub(super) sender: Sender<Vec<f32>>,
+    pub(super) spares: Receiver<Vec<f32>>,
+    pub(super) failed: Arc<AtomicBool>,
+    pub(super) quiet: Arc<AtomicBool>,
+}
+
 impl Capture {
     /// Start recording, or say in words why this computer can't.
     pub(super) fn start(host: &cpal::Host) -> Result<Self, String> {
@@ -35,48 +54,20 @@ impl Capture {
         if !mac_version().is_some_and(|version| version >= (14, 6)) {
             return Err("Sharing a Mac's sound needs macOS 14.6 or later".into());
         }
-        let device = host
-            .default_output_device()
-            .ok_or("It has no speakers or headphones to share the sound of")?;
-        let supported = device
-            .default_output_config()
-            .map_err(|error| format!("Can't read its sound format: {error}"))?;
-        let config = supported.config();
-        let channels = usize::from(config.channels);
         let (sender, packets) = crossbeam_channel::bounded(QUEUE);
         let (spare, spares) = crossbeam_channel::bounded(QUEUE);
         let failed = Arc::new(AtomicBool::new(false));
         let quiet = Arc::new(AtomicBool::new(false));
         let parts = Parts {
-            channels,
             sender,
             spares,
             failed: failed.clone(),
             quiet: quiet.clone(),
         };
-        use cpal::SampleFormat as Format;
-        let stream = match supported.sample_format() {
-            Format::F32 => record::<f32>(&device, config, parts),
-            Format::I16 => record::<i16>(&device, config, parts),
-            Format::I32 => record::<i32>(&device, config, parts),
-            Format::F64 => record::<f64>(&device, config, parts),
-            Format::U16 => record::<u16>(&device, config, parts),
-            Format::U8 => record::<u8>(&device, config, parts),
-            Format::I8 => record::<i8>(&device, config, parts),
-            other => return Err(format!("Its sound format ({other}) isn't supported")),
-        }
-        .map_err(|error| format!("Can't record its sound: {error}"))?;
-        stream
-            .play()
-            .map_err(|error| format!("Can't record its sound: {error}"))?;
-        log::info!(
-            "recording the sound of {device} at {} Hz, {channels} channel(s)",
-            config.sample_rate
-        );
+        let (source, rate) = open(host, parts)?;
         Ok(Self {
-            _stream: stream,
-            device,
-            rate: config.sample_rate,
+            source,
+            rate,
             packets,
             spare,
             failed,
@@ -95,27 +86,76 @@ impl Capture {
         let _ = self.spare.try_send(buffer);
     }
 
-    /// Still recording the default output device. After a failure, or when
-    /// the person picks other speakers, the recording starts again.
+    /// Still recording. After a failure, or on macOS when the person picks
+    /// other speakers, the recording starts again.
     pub(super) fn current(&self, host: &cpal::Host) -> bool {
-        !self.failed.load(Ordering::Acquire)
-            && host
-                .default_output_device()
-                .is_some_and(|device| device == self.device)
+        if self.failed.load(Ordering::Acquire) {
+            return false;
+        }
+        // Windows follows the devices by itself.
+        #[cfg(windows)]
+        let _ = (host, &self.source);
+        #[cfg(not(windows))]
+        if !host
+            .default_output_device()
+            .is_some_and(|default| default == self.source.device)
+        {
+            return false;
+        }
+        true
     }
 }
 
-struct Parts {
-    channels: usize,
-    sender: Sender<Vec<f32>>,
-    spares: Receiver<Vec<f32>>,
-    failed: Arc<AtomicBool>,
-    quiet: Arc<AtomicBool>,
+#[cfg(windows)]
+fn open(_: &cpal::Host, parts: Parts) -> Result<(Source, u32), String> {
+    let recording = super::loopback::Recording::start(parts)?;
+    Ok((recording, super::loopback::RATE))
 }
 
+#[cfg(not(windows))]
+fn open(host: &cpal::Host, parts: Parts) -> Result<(Source, u32), String> {
+    let device = host
+        .default_output_device()
+        .ok_or("It has no speakers or headphones to share the sound of")?;
+    let supported = device
+        .default_output_config()
+        .map_err(|error| format!("Can't read its sound format: {error}"))?;
+    let config = supported.config();
+    let channels = usize::from(config.channels);
+    use cpal::SampleFormat as Format;
+    let stream = match supported.sample_format() {
+        Format::F32 => record::<f32>(&device, config, channels, parts),
+        Format::I16 => record::<i16>(&device, config, channels, parts),
+        Format::I32 => record::<i32>(&device, config, channels, parts),
+        Format::F64 => record::<f64>(&device, config, channels, parts),
+        Format::U16 => record::<u16>(&device, config, channels, parts),
+        Format::U8 => record::<u8>(&device, config, channels, parts),
+        Format::I8 => record::<i8>(&device, config, channels, parts),
+        other => return Err(format!("Its sound format ({other}) isn't supported")),
+    }
+    .map_err(|error| format!("Can't record its sound: {error}"))?;
+    stream
+        .play()
+        .map_err(|error| format!("Can't record its sound: {error}"))?;
+    log::info!(
+        "recording the sound of {device} at {} Hz, {channels} channel(s)",
+        config.sample_rate
+    );
+    let rate = config.sample_rate;
+    Ok((
+        Source {
+            _stream: stream,
+            device,
+        },
+        rate,
+    ))
+}
+
+#[cfg(not(windows))]
 fn record<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
+    channels: usize,
     parts: Parts,
 ) -> Result<cpal::Stream, cpal::Error>
 where
@@ -123,7 +163,6 @@ where
     f32: cpal::FromSample<T>,
 {
     let Parts {
-        channels,
         sender,
         spares,
         failed,

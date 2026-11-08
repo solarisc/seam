@@ -2,14 +2,16 @@
 
 /// Half the smallest 16-bit step. Quieter samples round to zero, so a packet
 /// of them would play back as digital silence anyway.
-const SILENCE: f32 = 1.0 / 65_536.0;
+pub(super) const SILENCE: f32 = 1.0 / 65_536.0;
 const FULL_SCALE: f32 = 32_768.0;
+#[cfg(any(not(windows), test))]
 const HALF: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 /// Fold one capture buffer of `channels` interleaved channels into stereo,
 /// appended to `stereo`. Centre and surround channels are mixed in at -3 dB;
 /// the low-frequency channel of 5.1 and 7.1 is left out, as a stereo downmix
-/// conventionally does.
+/// conventionally does. Windows records stereo to begin with.
+#[cfg(any(not(windows), test))]
 pub(super) fn downmix<T>(input: &[T], channels: usize, stereo: &mut Vec<f32>)
 where
     T: cpal::Sample,
@@ -62,6 +64,7 @@ pub(super) fn silent(samples: &[f32]) -> bool {
 }
 
 /// `silent` for samples as recorded, in any format.
+#[cfg(not(windows))]
 pub(super) fn silent_as_recorded<T>(samples: &[T]) -> bool
 where
     T: cpal::Sample,

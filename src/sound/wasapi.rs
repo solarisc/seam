@@ -33,7 +33,7 @@ use windows::Win32::{
 const CAPACITY: i64 = 2_000_000;
 
 /// Join this thread to the multithreaded apartment, once.
-fn enter_com() {
+pub(super) fn enter_com() {
     thread_local! {
         static JOINED: () = {
             // Already joined, or joined as single-threaded by someone else,
@@ -55,7 +55,7 @@ fn default_speakers() -> Result<IMMDevice> {
     }
 }
 
-fn id_of(device: &IMMDevice) -> Result<String> {
+pub(super) fn id_of(device: &IMMDevice) -> Result<String> {
     unsafe {
         let id = device.GetId()?;
         let text = id.to_string();
