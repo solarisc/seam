@@ -1617,13 +1617,24 @@ mod tests {
             assert_eq!(pair.saved(side).local_monitor, Some(50 + side as u32));
             assert_eq!(pair.saved(side).remote_monitor, Some(51 - side as u32));
         }
-        // A missing selected identity must not fall back to the reused handle.
+        // While the remembered display is gone, the main display stands in
+        // and the identity stays remembered on both computers.
         let all = pair.layouts[1].local_monitors();
         pair.layouts[1].update_monitors(all.iter().filter(|m| m.id != 51).cloned().collect());
         pair.wait_for(|p| p.stats.iter().all(|s| !s.connected.load(Ordering::Acquire)));
         pair.join();
         pair.connect();
-        assert!(pair.layouts.iter().all(|s| !s.report().ready));
+        pair.wait_for(|p| p.layouts.iter().all(|s| s.report().ready));
+        assert_eq!(pair.saved(1).local_monitor, Some(2));
+        assert_eq!(pair.saved(0).remote_monitor, Some(2));
+        assert_eq!(
+            pair.saved_arrangement(1).local_monitor_uuid.as_deref(),
+            Some("physical-1")
+        );
+        assert_eq!(
+            pair.saved_arrangement(0).remote_monitor_uuid.as_deref(),
+            Some("physical-1")
+        );
         pair.layouts[1].update_monitors(all);
         pair.wait_for(|p| p.stats.iter().all(|s| !s.connected.load(Ordering::Acquire)));
         pair.join();
@@ -1633,13 +1644,61 @@ mod tests {
     }
 
     #[test]
-    fn removed_seam_display_stays_unavailable_until_user_selects_replacement() {
+    fn main_display_stands_in_for_a_removed_seam_display_until_it_returns() {
         // Unlike a normal layout edit, topology changes terminate the input
         // session. Exercise removal at each end through real encrypted sessions.
+        let reconnect = |pair: &mut LayoutPair| {
+            pair.wait_for(|p| p.stats.iter().all(|s| !s.connected.load(Ordering::Acquire)));
+            pair.join();
+            pair.connect();
+            pair.wait_for(|p| p.layouts.iter().all(|s| s.report().ready));
+        };
         for removed_side in 0..2 {
             let mut pair = LayoutPair::new();
             pair.wait_for(|p| p.layouts.iter().all(|s| s.report().ready));
+            for side in 0..2 {
+                let mut displays = pair.layouts[side].local_monitors();
+                displays[0].identity = Some(format!("physical-{side}"));
+                pair.layouts[side].update_monitors(displays);
+            }
+            reconnect(&mut pair);
             let original = pair.saved(removed_side);
+            let remembered = pair.saved_arrangement(removed_side).local_monitor_uuid;
+            assert!(remembered.is_some());
+
+            // A laptop's lid closes: another display takes over.
+            let before = pair.layouts[removed_side].local_monitors();
+            let mut replacement = before.clone();
+            replacement[0].id = 50;
+            replacement[0].x = -1920;
+            replacement[0].identity = Some("external".into());
+            pair.layouts[removed_side].update_monitors(replacement);
+            reconnect(&mut pair);
+            assert!(pair.layouts.iter().all(|s| s.report().error.is_empty()));
+            assert_eq!(pair.saved(removed_side).local_monitor, Some(50));
+            assert_eq!(pair.saved(1 - removed_side).remote_monitor, Some(50));
+            assert_eq!(
+                pair.saved_arrangement(removed_side).local_monitor_uuid,
+                remembered,
+                "a display standing in must not replace the remembered one"
+            );
+            assert_eq!(
+                pair.saved_arrangement(1 - removed_side).remote_monitor_uuid,
+                remembered
+            );
+
+            // The lid opens: the edge goes back to its own display.
+            pair.layouts[removed_side].update_monitors(before);
+            reconnect(&mut pair);
+            assert_eq!(pair.saved(removed_side), original);
+        }
+    }
+
+    #[test]
+    fn without_identities_the_main_display_takes_over_a_removed_seam_display() {
+        for removed_side in 0..2 {
+            let mut pair = LayoutPair::new();
+            pair.wait_for(|p| p.layouts.iter().all(|s| s.report().ready));
             let mut replacement = pair.layouts[removed_side].local_monitors();
             replacement[0].id = 50;
             replacement[0].x = -1920;
@@ -1647,35 +1706,8 @@ mod tests {
             pair.wait_for(|p| p.stats.iter().all(|s| !s.connected.load(Ordering::Acquire)));
             pair.join();
             pair.connect();
-            assert!(pair.layouts.iter().all(|s| !s.report().ready));
-            assert_eq!(
-                pair.saved(removed_side),
-                original,
-                "hotplug must not save a fallback seam"
-            );
-            assert!(
-                pair.layouts
-                    .iter()
-                    .all(|s| s.report().error.contains("display is no longer available"))
-            );
-            let service = &pair.layouts[removed_side];
-            let report = service.report();
-            let replacement = Layout {
-                local_monitor: Some(50),
-                ..report.layout
-            };
-            let receipt = service
-                .request(replacement.clone(), report.revision)
-                .unwrap()
-                .recv_timeout(Duration::from_secs(3))
-                .unwrap()
-                .unwrap();
-            pair.wait_for(|p| {
-                p.layouts
-                    .iter()
-                    .all(|s| s.report().ready && s.report().revision == receipt.revision)
-            });
-            assert_eq!(pair.saved(removed_side), replacement);
+            pair.wait_for(|p| p.layouts.iter().all(|s| s.report().ready));
+            assert_eq!(pair.saved(removed_side).local_monitor, Some(50));
             assert_eq!(pair.saved(1 - removed_side).remote_monitor, Some(50));
         }
     }

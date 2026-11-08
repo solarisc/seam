@@ -110,11 +110,9 @@ belongs to under the computer's name on the **Screens** page. Selections are
 remembered across restarts and monitor changes.
 
 Seam follows display changes within a second, such as plugging a monitor
-into a laptop, closing its lid or changing a resolution. If the display an
-edge belongs to is disconnected, the computer shows **Selected display is no
-longer available** and its picker shows **Disconnected display**. Choose
-another display there, or **Main display**. Seam never moves an edge to a
-display on its own.
+into a laptop, closing its lid or changing a resolution. While the display
+an edge belongs to is disconnected, that computer's main display takes its
+place, and the edge goes back to it once it's connected again.
 
 ### Keyboard shortcuts
 

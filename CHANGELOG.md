@@ -12,12 +12,12 @@
   macOS to announce the change, which some versions never do. Every computer
   now checks its displays each second and reconnects with the new layout
   within a second of a change. Update Seam on the Mac to get this fix.
-- **A display that's gone can be replaced from the Screens page.** When the
-  display an edge belonged to was disconnected and the computer had only one
-  display left, the display picker stayed hidden, leaving **Selected display
-  is no longer available** with nothing to choose. The picker now appears
-  whenever the chosen display is gone, showing **Disconnected display**.
-  Choose a display there, or **Main display**.
+- **The main display takes over from a disconnected one.** When the display
+  an edge belonged to was disconnected, as when a laptop's lid closes, that
+  computer stopped taking the pointer and showed **Selected display is no
+  longer available**. With only one display left, there was no picker to
+  choose another. Now the computer's main display takes the edge until the
+  chosen display is connected again, and the edge then goes back to it.
 
 ## 1.0.0
 

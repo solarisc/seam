@@ -524,8 +524,9 @@ const GONE: u32 = 0;
 
 /// Whether the display a computer's edge belongs to is gone, on this
 /// computer (`local`) or the other one (`remote`), as the agents found when
-/// they connected. Seam never moves an edge to a display nobody chose, so the
-/// person picks another, even when only one is left.
+/// they connected. The main display normally stands in, but an older Seam
+/// controlling this computer leaves the edge without a display. The person
+/// picks one then, even when only one is left.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Gone {
     local: bool,
