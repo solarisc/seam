@@ -75,6 +75,14 @@ enum Network {
     Spikes { base: f64, every: f64, late: f64 },
     /// Wireless: an exponential tail of mean `mean` ms, capped at `cap`.
     Tail { mean: f64, cap: f64 },
+    /// An irregular sender: up to `base` ms evenly, and a `share` of
+    /// packets between `least` and `most` ms late, evenly.
+    Irregular {
+        base: f64,
+        share: f64,
+        least: f64,
+        most: f64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -164,6 +172,18 @@ fn run(setup: &Setup, seconds: f64, seed: u64) -> Outcome {
                     random.next() * base + if spike { late } else { 0.0 }
                 }
                 Network::Tail { mean, cap } => (-mean * (1.0 - random.next()).ln()).min(cap),
+                Network::Irregular {
+                    base,
+                    share,
+                    least,
+                    most,
+                } => {
+                    if random.next() < share {
+                        least + random.next() * (most - least)
+                    } else {
+                        random.next() * base
+                    }
+                }
             } * 1000.0;
             let mut arrival = (recorded + late).max(last_arrival);
             if held {
@@ -410,6 +430,38 @@ fn setups() -> Vec<(bool, Setup)> {
                 name: "20 ms packets",
                 packet: 960,
                 network: Network::Even(1.0),
+                ..base
+            },
+        ),
+        (
+            false,
+            Setup {
+                name: "irregular virtual device, packets near the take",
+                network: Network::Irregular {
+                    base: 0.3,
+                    share: 0.04,
+                    least: 3.0,
+                    most: 7.0,
+                },
+                doubled: 0.01,
+                ppm: -20.0,
+                phase_ms: 1.0,
+                ..base
+            },
+        ),
+        (
+            true,
+            Setup {
+                name: "irregular virtual device, often doubled",
+                network: Network::Irregular {
+                    base: 0.5,
+                    share: 0.03,
+                    least: 2.0,
+                    most: 6.0,
+                },
+                doubled: 0.03,
+                ppm: 25.0,
+                phase_ms: 1.6,
                 ..base
             },
         ),

@@ -40,298 +40,80 @@ pub(super) trait Speaker {
     }
 }
 
-/// When packets arrive against the moments the speakers take sound, and so
-/// how many of the speakers' periods each packet needs held for it.
+/// How close packets come to the speakers taking sound. A packet that
+/// arrives just before a take misses it when it comes a little late, so only
+/// then must a packet be held in reserve. Holding starts as soon as a packet
+/// comes within 2 ms of a take, and ends once every packet for 5 minutes has
+/// kept more than 3 ms clear: some devices deliver a packet late only every
+/// minute or two, and the delay shouldn't swing back and forth.
 ///
-/// Each packet's arrival is placed on the speakers' clock: the takes so far
-/// (frames written less those still waiting) and the time to the next. Less
-/// where packets would arrive were they never late, each a packet's length
-/// after the last, that tells how late each packet came against where
-/// packets usually arrive, even by more than a period, and wherever packets
-/// and periods differ in length. Where packets usually arrive moves as the
-/// two clocks drift, minutes from one take to the next, so it is followed
-/// packet by packet; how late they come is the network's and the sender's
-/// own.
-///
-/// A packet that usually arrives `s` before its take and comes `late` misses
-/// `ceil((late - s) / period)` takes, and the buffer must then still hold
-/// that many periods when it should have arrived. So each packet needs as
-/// many periods as lateness lately, plus a guard, would make it miss. The
-/// worst lateness is rare (some devices deliver a packet late only every
-/// minute or two), so the latest of each look (2 s) is remembered for 5
-/// minutes, and until 5 minutes have been seen every packet needs a period.
-/// Of those looks the second latest counts: lateness that came once in 5
-/// minutes, such as one stall of the network, mustn't hold the delay high for
-/// 5 minutes. No more periods are held than fit in 40 ms (`EXCESS`), the
-/// least the buffer keeps beyond its target before dropping the oldest:
-/// later than that is a stall, which running dry handles.
-///
-/// Running dry can't be measured: while nothing was there to take, the
-/// speakers' clock ran on without the frames written less those waiting. So
-/// a gap is charged as lateness one period beyond what was measured when it
-/// came, however many gaps came before, and like lateness the charge counts
-/// only once a second look within 5 minutes has one too; a lone gap is held
-/// for by `Pacing` for a few seconds. A gap made by a stall is not charged
-/// at all (see `stalled`).
-///
-/// The guard is 1 ms, as the speakers' own moment of taking sound wavers that
-/// much in a way no packet shows. Drift that brings packets closer to their
-/// takes counts as time to spare already gone, as much as it takes while the
-/// steering brings a period in, but never past the take. Held periods stay
-/// while half the guard and the drift again still ask for them, so the delay
-/// doesn't swing on a time to spare that wavers about the line.
+/// A packet that comes late enough to miss its take seems to arrive early for
+/// the next one, so time to spare is also counted from where packets usually
+/// arrive: one that missed its take has less than none.
 struct Arrivals {
-    /// Where the packets so far would have arrived were they never late, in
-    /// the speakers' frames, from where the first did.
-    expected: f64,
-    /// How far behind `expected` packets usually arrive.
+    /// Where in the speakers' period packets usually arrive, as time to spare.
     usual: Option<f64>,
-    /// The latest a packet came this look, the lateness charged this look
-    /// for running dry, and the seconds of sound it has covered.
-    late: f64,
-    dry: f64,
-    covered: f64,
-    /// The look this packet closed holds a charge for running dry that a
-    /// stall, piling up the packets just after it, may yet show to be no
-    /// lateness.
-    charged: bool,
-    /// Where packets usually arrived when the drift was last measured, and
-    /// the seconds of sound since.
-    began: Option<f64>,
-    since: f64,
-    /// The latest and the charge for running dry of each recent look, newest
-    /// first, and how many looks have been seen, up to all of them.
-    looks: [(f64, f64); Arrivals::LOOKS],
+    /// The least time to spare this look, and in each recent look.
+    closest: Option<isize>,
+    looks: [Option<isize>; Arrivals::LOOKS],
     seen: usize,
-    /// Of the looks remembered: the latest and second latest lateness, and
-    /// the largest and second largest charge.
-    latest: (f64, f64),
-    dried: (f64, f64),
-    /// The lateness measured for the last packet, and the seconds of sound
-    /// heard, up to 5 minutes.
-    measured: f64,
-    heard: f64,
-    /// How fast packets come later against the speakers' clock, in frames a
-    /// second, averaged over about four looks; drift is steady, the noise of
-    /// one look isn't.
-    drift: Option<f64>,
-    /// The speakers' period, once they told it.
-    period: Option<f64>,
+    clear: bool,
 }
 
 impl Default for Arrivals {
     fn default() -> Self {
         Self {
-            expected: 0.0,
             usual: None,
-            late: f64::NEG_INFINITY,
-            dry: f64::NEG_INFINITY,
-            covered: 0.0,
-            charged: false,
-            began: None,
-            since: 0.0,
-            looks: [(f64::NEG_INFINITY, f64::NEG_INFINITY); Self::LOOKS],
+            closest: None,
+            looks: [None; Self::LOOKS],
             seen: 0,
-            latest: (f64::NEG_INFINITY, f64::NEG_INFINITY),
-            dried: (f64::NEG_INFINITY, f64::NEG_INFINITY),
-            measured: 0.0,
-            heard: 0.0,
-            drift: None,
-            period: None,
+            clear: false,
         }
-    }
-}
-
-/// What one packet's arrival tells.
-struct Arrival {
-    /// Periods to hold for it, with the guard and with half the guard (and
-    /// the drift) again.
-    up: usize,
-    down: usize,
-    /// Takes it missed by coming later than usual; fewer than none when it
-    /// came early enough to catch an earlier take.
-    missed: isize,
-}
-
-/// The second largest of `top`, the two largest remembered, and `now`.
-fn second(top: (f64, f64), now: f64) -> f64 {
-    if now >= top.0 { top.0 } else { now.max(top.1) }
-}
-
-/// `top`, the two largest so far, with `value` among them.
-fn with(top: (f64, f64), value: f64) -> (f64, f64) {
-    if value > top.0 {
-        (value, top.0)
-    } else {
-        (top.0, top.1.max(value))
     }
 }
 
 impl Arrivals {
-    /// Looks remembered, and the sound each covers: 5 minutes.
+    /// Looks that must all be clear before the reserve is let go: 5 minutes.
     const LOOKS: usize = 150;
-    const LOOK: f64 = 2.0;
-    /// How quickly the usual arrival follows packets that come later than
-    /// it, and earlier: it follows the clocks' drift and keeps near the
-    /// earliest packets, as lateness only ever delays them.
+    /// Packets seen per look: 2 s of 10 ms packets.
+    const PER_LOOK: usize = 200;
+    /// How quickly the usual time to spare follows the packets.
     const FOLLOW: f64 = 1.0 / 64.0;
-    const CATCH: f64 = 1.0 / 8.0;
-    /// The frames waiting are read before the speakers' clock, so a take
-    /// can fall between: the clock then tells a take just past, which the
-    /// frames waiting don't yet show, and the packet seems a period early.
-    /// So a packet this close after a take that seems that early is counted
-    /// a period later. (A packet can't truly come a period early: those
-    /// before it would have had to come a period late.)
-    const UNSURE: f64 = 0.001;
 
-    /// Count from the next packet afresh, as when sound starts or the
-    /// speakers ran dry: while there was nothing to take, the speakers'
-    /// clock ran on without the frames written less those waiting.
-    fn restart(&mut self) {
-        self.expected = 0.0;
-        self.usual = None;
-        self.began = None;
-    }
-
-    /// The speakers ran dry: a packet came later than the periods held for
-    /// it. Charge lateness one period beyond what was measured when it came;
-    /// a further gap charges the same, not a period more each time.
-    fn ran_dry(&mut self) {
-        if let Some(period) = self.period {
-            self.dry = self.dry.max(self.measured + period);
-        }
-        self.restart();
-    }
-
-    /// Packets piled up beyond what the buffer keeps before dropping the
-    /// oldest (`Pacing::excess`, the target and at least 40 ms more), so the
-    /// network stalled for longer than the buffer plus all that: the gap it
-    /// made would have come with a period more held too, and with several,
-    /// so it is no lateness to hold for. Its charge is dropped, from the
-    /// last look closed too if that took it in since.
-    fn stalled(&mut self) {
-        self.dry = f64::NEG_INFINITY;
-        if std::mem::take(&mut self.charged) {
-            self.looks[0].1 = f64::NEG_INFINITY;
-            self.remember();
-        }
-        self.restart();
-    }
-
-    /// A packet of `frames` (in the speakers' frames), lasting `seconds`,
-    /// arrived when the speakers had taken `taken` frames and would take
-    /// more `spare` frames later, as they do every `period` frames at `rate`.
-    fn saw(
-        &mut self,
-        taken: u64,
-        spare: usize,
-        period: usize,
-        frames: f64,
-        rate: u32,
-        seconds: f64,
-    ) -> Arrival {
+    /// A packet arrived `spare` frames before the speakers take sound, which
+    /// they do every `period` frames at `rate`. True while no packet need be
+    /// held in reserve.
+    fn saw(&mut self, spare: usize, period: usize, rate: u32) -> bool {
         let period = period.max(1) as f64;
-        self.period = Some(period);
-        // Only the packet just after a look closed can show its charge was a
-        // stall's.
-        self.charged = false;
-        let spare = (spare as f64).min(period);
-        self.expected += frames;
-        let mut at = taken as f64 + period - spare - self.expected;
-        let late = match self.usual {
-            None => {
-                self.usual = Some(at);
-                0.0
-            }
-            Some(usual) => {
-                let unsure = (f64::from(rate) * Self::UNSURE).min(period / 4.0);
-                if period - spare < unsure && at < usual - period / 2.0 {
-                    at += period;
-                }
-                let late = at - usual;
-                let follow = if late < 0.0 {
-                    Self::CATCH
-                } else {
-                    Self::FOLLOW
-                };
-                self.usual = Some(usual + late * follow);
-                late
-            }
-        };
-        self.late = self.late.max(late);
-        self.covered += seconds;
-        self.since += seconds;
-        self.heard = (self.heard + seconds).min(Self::LOOKS as f64 * Self::LOOK);
-        if self.covered >= Self::LOOK {
-            self.look();
+        let usual = *self.usual.get_or_insert(spare as f64);
+        // How much earlier than usual this packet came. Packets come late far
+        // more than early, so up to a fifth of a period early counts as early,
+        // and anything else as late.
+        let early = period / 5.0;
+        let off = (spare as f64 - usual + period - early).rem_euclid(period) - (period - early);
+        self.usual = Some((usual + off * Self::FOLLOW).rem_euclid(period));
+        // Coming earlier than usual is as close when it catches an earlier
+        // take: the next packet, on time, then misses its own.
+        let spare = ((usual + off).round() as isize).min(spare as isize);
+        let closest = self.closest.map_or(spare, |closest| closest.min(spare));
+        self.closest = Some(closest);
+        self.seen += 1;
+        if self.seen >= Self::PER_LOOK {
+            self.looks.rotate_right(1);
+            self.looks[0] = self.closest.take();
+            self.seen = 0;
         }
-        // Had it come as usual: its time to spare, and the takes since.
-        let usual_spare = (spare + late).rem_euclid(period);
-        let missed = ((spare + late - usual_spare) / period).round() as isize;
-        let mut measured = second(self.latest, self.late).max(0.0);
-        // Until 5 minutes are seen, every packet needs a period, and packets
-        // may yet come later than any so far: the latest of a long-tailed
-        // spread grows with the log of how many packets came, so the latest
-        // so far is scaled by the log of the packets of 5 minutes over the
-        // log of those heard.
-        let unseen = self.seen < Self::LOOKS;
-        if unseen && seconds > 0.0 {
-            let heard = self.heard.max(Self::LOOK) / seconds;
-            let all = Self::LOOKS as f64 * Self::LOOK / seconds;
-            let latest = self.latest.0.max(self.late);
-            measured = measured.max(latest * all.ln() / heard.ln().max(1.0));
+        let (near, far) = (rate as isize / 500, rate as isize / 333);
+        if self.clear {
+            self.clear = closest >= near;
+        } else {
+            self.clear = closest > far
+                && self
+                    .looks
+                    .iter()
+                    .all(|look| look.is_some_and(|spare| spare > far));
         }
-        self.measured = measured;
-        let most = measured.max(second(self.dried, self.dry));
-        // Drift brings the packet this much closer to its take while the
-        // steering brings a period in; past the take it would need fewer.
-        let lead = self.drift.unwrap_or(0.0).max(0.0) * pacing::SETTLE;
-        let floor = f64::from(rate) / 1000.0;
-        let most_periods =
-            ((f64::from(rate) * pacing::EXCESS.as_secs_f64() / period) as usize).max(1);
-        let periods = |scale: f64| {
-            let spare = (usual_spare - scale * lead).max(0.0);
-            let periods = ((most + scale * floor - spare) / period).ceil().max(0.0) as usize;
-            periods.max(usize::from(unseen)).min(most_periods)
-        };
-        Arrival {
-            up: periods(1.0),
-            down: periods(1.5),
-            missed,
-        }
-    }
-
-    /// A look ends: remember it, and measure the drift.
-    fn look(&mut self) {
-        if let Some(usual) = self.usual {
-            if let Some(began) = self.began
-                && self.since > 0.0
-            {
-                let drift = (usual - began) / self.since;
-                self.drift = Some(self.drift.map_or(drift, |last| last + (drift - last) / 4.0));
-            }
-            self.began = Some(usual);
-            self.since = 0.0;
-        }
-        let dry = std::mem::replace(&mut self.dry, f64::NEG_INFINITY);
-        self.charged = dry > f64::NEG_INFINITY;
-        self.looks.rotate_right(1);
-        self.looks[0] = (std::mem::replace(&mut self.late, f64::NEG_INFINITY), dry);
-        self.seen = (self.seen + 1).min(Self::LOOKS);
-        self.covered = 0.0;
-        self.remember();
-    }
-
-    /// Of the looks remembered, find the two latest and the two largest
-    /// charges.
-    fn remember(&mut self) {
-        let none = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-        (self.latest, self.dried) = self
-            .looks
-            .iter()
-            .fold((none, none), |(latest, dried), &(late, dry)| {
-                (with(latest, late), with(dried, dry))
-            });
+        self.clear
     }
 }
 
@@ -354,8 +136,6 @@ pub(super) struct Push<S> {
     mapped: Vec<f32>,
     /// Sound is streaming in: since the last pause, written without a gap.
     streaming: bool,
-    /// Frames written to these speakers, for the takes so far.
-    written: u64,
     /// The speakers started, or failed to: the player should look.
     woke: bool,
     /// Packets received, so the player can tell sound is arriving.
@@ -381,7 +161,6 @@ impl<S: Speaker> Push<S> {
             converted: Vec::new(),
             mapped: Vec::new(),
             streaming: false,
-            written: 0,
             woke: false,
             received: 0,
             retry: None,
@@ -458,7 +237,6 @@ impl<S: Speaker> Push<S> {
             match (self.open)() {
                 Ok(speaker) => {
                     self.speaker = Some(speaker);
-                    self.written = 0;
                     self.retry = None;
                     self.problem = None;
                     self.streaming = false;
@@ -505,13 +283,11 @@ impl<S: Speaker> Push<S> {
         // Buffered before this packet, in the sender's frames: in the
         // speakers, and waiting for a whole step.
         let buffered = (padding as f64 / output_per_source) as usize + before / 2;
-        let taken = self.written.saturating_sub(padding as u64);
         let target = self.pacing.target();
         let top_up = if !self.streaming {
             // Sound starts: begin at the target, not at whatever is left.
             self.streaming = true;
             self.steering.average = None;
-            self.arrivals.restart();
             if let Some(converter) = &mut self.converter {
                 converter.reset();
             }
@@ -519,7 +295,7 @@ impl<S: Speaker> Push<S> {
         } else if padding == 0 {
             // The speakers ran out before this arrived.
             self.pacing.ran_dry();
-            self.arrivals.ran_dry();
+            self.arrivals = Arrivals::default();
             self.pacing.target().saturating_sub(buffered)
         } else {
             self.pacing.low_point(buffered);
@@ -532,7 +308,6 @@ impl<S: Speaker> Push<S> {
                 // Far behind, as after the network held packets back: skip
                 // this packet rather than play late from now on.
                 self.input.truncate(before);
-                self.arrivals.stalled();
                 return Ok(());
             }
             0
@@ -545,34 +320,29 @@ impl<S: Speaker> Push<S> {
             self.mapped.clear();
             self.mapped.resize(silence.min(room) * channels, 0.0);
             speaker.write(&self.mapped)?;
-            self.written += silence.min(room) as u64;
         }
         self.write_input()?;
-        match self.speaker.as_mut().and_then(Speaker::next_take) {
+        let output_rate = self.speakers_rate();
+        let clear = match self.speaker.as_mut().and_then(Speaker::next_take) {
             Some((spare, period)) => {
                 // The period in the sender's frames.
-                let source_period = (period as f64 / output_per_source).round().max(1.0) as usize;
+                let source_period = (period as f64 * f64::from(self.pacing.rate())
+                    / f64::from(output_rate.max(1)))
+                .round() as usize;
                 self.pacing.takes_known(source_period);
-                let arrival = self.arrivals.saw(
-                    taken,
-                    spare,
-                    period,
-                    frames as f64 * output_per_source,
-                    output_rate,
-                    frames as f64 / f64::from(source_rate),
-                );
-                if top_up == 0 {
-                    // Its fill had it come as usual.
-                    let fill = buffered as isize + arrival.missed * source_period as isize;
-                    self.pacing.need(arrival.up, arrival.down, fill);
-                }
+                self.arrivals.saw(spare, period, output_rate)
             }
             None => {
                 self.arrivals = Arrivals::default();
-                self.pacing.takes_unknown();
+                false
             }
-        }
+        };
+        self.pacing.hold_reserve(!clear);
         Ok(())
+    }
+
+    fn speakers_rate(&self) -> u32 {
+        self.speaker.as_ref().map_or(48_000, Speaker::rate)
     }
 
     /// Convert every whole step waiting and write it to the speakers.
@@ -609,9 +379,7 @@ impl<S: Speaker> Push<S> {
                 }
             }
         }
-        speaker.write(&self.mapped)?;
-        self.written += (self.mapped.len() / channels.max(1)) as u64;
-        Ok(())
+        speaker.write(&self.mapped)
     }
 }
 
@@ -817,133 +585,16 @@ mod tests {
     }
 
     #[test]
-    fn a_packet_late_by_more_than_a_period_needs_as_many_periods() {
-        // Packets 5 ms before each take, every 10 ms of the speakers' clock,
-        // `late` takes after their own.
+    fn a_packet_that_misses_its_take_counts_as_close() {
         let mut arrivals = Arrivals::default();
-        let mut packet = 0u64;
-        let mut saw = |arrivals: &mut Arrivals, late: u64| {
-            packet += 1;
-            arrivals.saw((packet + late) * 480, 240, 480, 480.0, 48_000, 0.01)
-        };
-        // Long enough to need no period.
-        for _ in 0..200 * (Arrivals::LOOKS + 1) {
-            assert_eq!(saw(&mut arrivals, 0).missed, 0);
+        // Packets 5 ms before each take, long enough to let the reserve go.
+        for _ in 0..Arrivals::PER_LOOK * (Arrivals::LOOKS + 1) {
+            arrivals.saw(240, 480, 48_000);
         }
-        assert_eq!(saw(&mut arrivals, 0).up, 0);
-        // One comes 20 ms late: it missed two takes. One stall alone isn't
-        // held for.
-        assert_eq!(saw(&mut arrivals, 2).missed, 2);
-        assert_eq!(saw(&mut arrivals, 0).up, 0);
-        // Another, in another look: from then on each packet needs two.
-        for _ in 0..400 {
-            saw(&mut arrivals, 0);
-        }
-        assert_eq!(saw(&mut arrivals, 2).missed, 2);
-        let next = saw(&mut arrivals, 0);
-        assert_eq!((next.missed, next.up), (0, 2));
-    }
-
-    /// Arrivals that have seen 5 minutes of packets 5 ms before each take,
-    /// and a way to show them one more, on time.
-    fn settled_arrivals() -> (Arrivals, impl FnMut(&mut Arrivals) -> Arrival) {
-        let mut arrivals = Arrivals::default();
-        let mut packet = 0u64;
-        let mut saw = move |arrivals: &mut Arrivals| {
-            packet += 1;
-            arrivals.saw(packet * 480, 240, 480, 480.0, 48_000, 0.01)
-        };
-        for _ in 0..200 * (Arrivals::LOOKS + 1) {
-            saw(&mut arrivals);
-        }
-        assert_eq!(saw(&mut arrivals).up, 0);
-        (arrivals, saw)
-    }
-
-    /// Show packets until the next look begins.
-    fn next_look(arrivals: &mut Arrivals, saw: &mut impl FnMut(&mut Arrivals) -> Arrival) {
-        arrivals.covered = Arrivals::LOOK;
-        saw(arrivals);
-    }
-
-    #[test]
-    fn speakers_that_stop_telling_their_takes_get_a_packet_in_reserve_at_once() {
-        // Packets clear of the takes, long enough to hold no period.
-        let (device, mut push, _) = run_on(telling(3), 1.0, 0, 420, true);
-        assert!(push.pacing().target() < 480 + 96);
-        device.lock().unwrap().tells = false;
-        push.push(&tone(0, 480));
-        let general = push.pacing().frames_in(Duration::from_millis(4));
-        assert!(push.pacing().target() >= 480 + general);
-    }
-
-    #[test]
-    fn one_gap_alone_is_not_held_for() {
-        let (mut arrivals, mut saw) = settled_arrivals();
-        arrivals.ran_dry();
-        assert_eq!(saw(&mut arrivals).up, 0, "this look");
-        next_look(&mut arrivals, &mut saw);
-        assert_eq!(saw(&mut arrivals).up, 0, "after it");
-    }
-
-    #[test]
-    fn gaps_again_hold_one_period_and_no_more() {
-        let (mut arrivals, mut saw) = settled_arrivals();
-        for gap in 0..6 {
-            arrivals.ran_dry();
-            saw(&mut arrivals);
-            next_look(&mut arrivals, &mut saw);
-            let up = saw(&mut arrivals).up;
-            assert_eq!(up, usize::from(gap > 0), "after gap {gap}");
-        }
-        // Forgotten 5 minutes later.
-        for _ in 0..Arrivals::LOOKS {
-            next_look(&mut arrivals, &mut saw);
-        }
-        assert_eq!(saw(&mut arrivals).up, 0);
-    }
-
-    #[test]
-    fn a_stall_is_not_held_for() {
-        let (mut arrivals, mut saw) = settled_arrivals();
-        for _ in 0..4 {
-            arrivals.ran_dry();
-            saw(&mut arrivals);
-            arrivals.stalled();
-            next_look(&mut arrivals, &mut saw);
-        }
-        assert_eq!(saw(&mut arrivals).up, 0);
-        // Also when the packet after the gap closed the look first.
-        for _ in 0..4 {
-            arrivals.ran_dry();
-            next_look(&mut arrivals, &mut saw);
-            arrivals.stalled();
-            saw(&mut arrivals);
-        }
-        assert_eq!(saw(&mut arrivals).up, 0);
-    }
-
-    #[test]
-    fn packets_longer_than_a_period_are_each_expected_where_they_fall() {
-        // 512-frame packets against 480-frame takes, on time: each lands
-        // elsewhere in the period, and only those close to a take need one.
-        let mut arrivals = Arrivals::default();
-        let (mut close, mut clear) = (0, 0);
-        for packet in 1..=100 * 600u64 {
-            let at = packet * 512 + 100;
-            let spare = 480 - (at % 480) as usize;
-            let arrival = arrivals.saw(at / 480 * 480, spare, 480, 512.0, 48_000, 512.0 / 48_000.0);
-            assert_eq!(arrival.missed, 0);
-            assert!(arrival.up <= 1);
-            if packet > 100 * 400 {
-                if arrival.up == 0 {
-                    clear += 1;
-                } else {
-                    close += 1;
-                }
-            }
-        }
-        assert!(clear > 0 && close > 0, "{clear} clear, {close} close");
+        assert!(arrivals.clear);
+        // One comes 5.5 ms late: it missed its take, and seems 9.5 ms early
+        // for the next.
+        assert!(!arrivals.saw(456, 480, 48_000), "holds a packet again");
     }
 
     #[test]
