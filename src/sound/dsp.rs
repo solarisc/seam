@@ -84,28 +84,49 @@ impl Quantizer {
         Self { state: 0x9E37_79B9 }
     }
 
-    /// Uniform in [0, 1).
-    fn uniform(&mut self) -> f32 {
+    fn next(&mut self) -> u32 {
         // xorshift32: the dither only needs to be uncorrelated with the signal.
         self.state ^= self.state << 13;
         self.state ^= self.state >> 17;
         self.state ^= self.state << 5;
-        (self.state >> 8) as f32 / (1u32 << 24) as f32
+        self.state
     }
 
-    pub(super) fn quantize(&mut self, input: &[f32], output: &mut Vec<i16>) {
-        output.reserve(input.len());
+    /// Append `input` to `output` as 16-bit little-endian samples, the form
+    /// they travel in.
+    pub(super) fn quantize(&mut self, input: &[f32], output: &mut Vec<u8>) {
+        output.reserve(input.len() * 2);
         for &sample in input {
-            let dither = self.uniform() - self.uniform();
-            let value = (sample * FULL_SCALE + dither).round();
-            // `as` saturates, and turns NaN into silence.
-            output.push(value.clamp(-FULL_SCALE, FULL_SCALE - 1.0) as i16);
+            // The halves of one random number are two uniform draws; their
+            // difference is triangular, up to a step either way.
+            let random = self.next();
+            let dither = ((random >> 16) as f32 - (random & 0xFFFF) as f32) / 65_536.0;
+            output.extend_from_slice(&to_step(sample * FULL_SCALE + dither).to_le_bytes());
         }
     }
 }
 
-pub(super) fn to_float(samples: &[i16], output: &mut std::collections::VecDeque<f32>) {
-    output.extend(samples.iter().map(|&sample| f32::from(sample) / FULL_SCALE));
+/// The nearest 16-bit step to `value`, measured in steps; clipped, and NaN
+/// is silence. A conversion rather than a library call rounds: the call costs
+/// far more in the short bursts sound is sent in. Above zero, truncating after
+/// adding a half rounds to the nearest step.
+fn to_step(value: f32) -> i16 {
+    if value.is_nan() {
+        return 0;
+    }
+    let value = value.clamp(-FULL_SCALE, FULL_SCALE - 1.0);
+    ((value + FULL_SCALE + 0.5) as i32 - FULL_SCALE as i32) as i16
+}
+
+/// Decode 16-bit little-endian samples.
+pub(super) fn to_float(samples: &[u8], output: &mut impl Extend<f32>) {
+    output.extend(
+        samples
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| f32::from(i16::from_le_bytes(pair)) / FULL_SCALE),
+    );
 }
 
 #[cfg(test)]
@@ -150,10 +171,28 @@ mod tests {
         for (original, decoded) in input.iter().zip(&back).take(2_000) {
             assert!((original - decoded).abs() <= 2.0 / FULL_SCALE);
         }
+        let steps = samples(&wire);
         // Full scale, clipped levels and NaN. Dither may round -1.0 up a step.
-        assert_eq!(wire[2_000], i16::MAX);
-        assert!(wire[2_001] <= i16::MIN + 1);
-        assert_eq!(wire[2_002..], [i16::MAX, i16::MIN, 0]);
+        assert_eq!(steps[2_000], i16::MAX);
+        assert!(steps[2_001] <= i16::MIN + 1);
+        assert_eq!(steps[2_002..], [i16::MAX, i16::MIN, 0]);
+    }
+
+    fn samples(wire: &[u8]) -> Vec<i16> {
+        wire.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| i16::from_le_bytes(pair))
+            .collect()
+    }
+
+    #[test]
+    fn rounding_goes_to_the_nearest_step() {
+        let steps: Vec<i16> = [0.4, 0.6, -0.4, -0.6, 1.5, -1.6, 100.49, -32_767.7]
+            .into_iter()
+            .map(to_step)
+            .collect();
+        assert_eq!(steps, [0, 1, 0, -1, 2, -2, 100, -32_768]);
     }
 
     #[test]
@@ -164,7 +203,8 @@ mod tests {
         let mut quantizer = Quantizer::new();
         let mut wire = Vec::new();
         quantizer.quantize(&vec![level; 100_000], &mut wire);
-        let mean = wire.iter().map(|&s| f64::from(s)).sum::<f64>() / wire.len() as f64;
+        let steps = samples(&wire);
+        let mean = steps.iter().map(|&s| f64::from(s)).sum::<f64>() / steps.len() as f64;
         assert!((mean - 0.3).abs() < 0.02, "{mean}");
     }
 

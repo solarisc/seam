@@ -2855,6 +2855,7 @@ name = "seam"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "audio_thread_priority",
  "bincode",
  "blake3",
  "clipboard-rs",
@@ -2882,6 +2883,7 @@ dependencies = [
  "snow",
  "tempfile",
  "walkdir",
+ "windows 0.62.2",
  "windows-service",
  "windows-sys 0.61.2",
  "winresource",

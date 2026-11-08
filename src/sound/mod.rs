@@ -11,7 +11,20 @@
 //! ever waits for it, nor it for them.
 mod capture;
 mod dsp;
+mod pacing;
+// Windows writes sound straight into the speakers' buffer as it arrives;
+// macOS's speakers ask for it. Both are tested everywhere.
+#[cfg(any(not(windows), test))]
 mod playback;
+#[cfg(any(windows, test))]
+mod push;
+#[cfg(windows)]
+mod wasapi;
+
+#[cfg(not(windows))]
+use playback::Player;
+#[cfg(windows)]
+use wasapi::Player;
 
 use crate::{
     network::{SecureReader, SecureWriter},
@@ -57,13 +70,42 @@ struct Request {
 enum Message {
     /// Sound follows as interleaved stereo at this sample rate.
     Format { rate: u32 },
-    /// Interleaved 16-bit stereo samples.
-    Samples(Vec<i16>),
+    /// Interleaved 16-bit stereo samples, little-endian, carried as one block
+    /// of bytes rather than one value at a time.
+    Samples(#[serde(with = "bytes")] Vec<u8>),
     /// Nothing is playing. Samples resume with the next `Samples`.
     Pause,
     /// This computer can't share its sound right now, for the reason given,
     /// worded for the person. It keeps trying, and sends `Format` once it can.
     Unavailable(String),
+}
+
+/// A byte vector as one block of bytes, which bincode copies whole.
+mod bytes {
+    use serde::{Deserializer, Serializer, de};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        struct Bytes;
+        impl de::Visitor<'_> for Bytes {
+            type Value = Vec<u8>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("bytes")
+            }
+            fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+                Ok(bytes.to_vec())
+            }
+            fn visit_byte_buf<E: de::Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
+                Ok(bytes)
+            }
+        }
+        deserializer.deserialize_byte_buf(Bytes)
+    }
 }
 
 /// What the window shows about one connection's sound.
@@ -97,6 +139,19 @@ struct LinkState {
     status: Status,
     /// Counts wake-ups, so a waiter can't miss one between checking and waiting.
     wakes: u64,
+    /// The open connection's worker, told when sound is switched.
+    connection: Option<crossbeam_channel::Sender<Event>>,
+}
+
+/// What wakes the worker of an open connection on the controlling computer.
+enum Event {
+    /// A message other than samples or a pause, which the network thread
+    /// handles itself.
+    Message(Message),
+    /// Sound arrived while the speakers weren't running.
+    Sound,
+    /// Sound was switched, or the input session ended.
+    Changed,
 }
 
 impl Link {
@@ -127,6 +182,9 @@ impl Link {
                 state.status = Status::Off;
             }
             state.wakes += 1;
+            if let Some(connection) = &state.connection {
+                let _ = connection.try_send(Event::Changed);
+            }
             self.changed.notify_all();
         }
     }
@@ -136,7 +194,15 @@ impl Link {
     }
 
     fn set_status(&self, status: Status) {
-        self.state().status = status;
+        let mut state = self.state();
+        if state.status != status {
+            state.status = status;
+        }
+    }
+
+    /// Tell `connection` when sound is switched, until the next call.
+    fn notify(&self, connection: Option<crossbeam_channel::Sender<Event>>) {
+        self.state().connection = connection;
     }
 
     fn wake(&self) {
@@ -229,8 +295,8 @@ pub(crate) fn play(
     link.set_status(Status::Off);
 }
 
-/// Sound moves every 10 ms. Schedule its network threads as input's are, so
-/// a busy computer, such as one running a game, doesn't hold them back.
+/// Schedule this thread as input's are, so a busy computer, such as one
+/// running a game, doesn't hold it back.
 fn responsive() -> impl Sized {
     #[cfg(target_os = "macos")]
     return crate::input_priority::InputPriority::enter();
@@ -238,6 +304,34 @@ fn responsive() -> impl Sized {
     return crate::windows_priority::InputPriority::enter();
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     ()
+}
+
+/// Real-time audio scheduling for this thread while it lives: Windows' Pro
+/// Audio class, or a time-constraint thread on macOS. The threads that send
+/// what the recording delivers, and that write what arrives straight into the
+/// speakers, have the speakers' deadlines; a hiccup there is a gap in the
+/// sound. Their work is a few microseconds every 10 ms.
+struct Realtime(Option<audio_thread_priority::RtPriorityHandle>);
+
+impl Realtime {
+    fn enter() -> Self {
+        // What the scheduler is told to expect: 10 ms at 48 kHz.
+        match audio_thread_priority::promote_current_thread_to_real_time(480, 48_000) {
+            Ok(handle) => Self(Some(handle)),
+            Err(error) => {
+                log::debug!("sound runs without real-time scheduling: {error:?}");
+                Self(None)
+            }
+        }
+    }
+}
+
+impl Drop for Realtime {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = audio_thread_priority::demote_current_thread_from_real_time(handle);
+        }
+    }
 }
 
 /// The sound port didn't take the connection.
@@ -266,42 +360,79 @@ fn connect(
     let (mut reader, mut writer) = lease.connect(socket, code)?;
     writer.write(&Request { version: VERSION })?;
     reader.set_cancellation(lease.stop.clone())?;
-    let (messages, received) = crossbeam_channel::bounded(256);
-    let reading = thread::Builder::new()
-        .name("seam-sound-receive".into())
-        .spawn(move || -> Result<()> {
-            let _priority = responsive();
-            loop {
-                if messages.send(reader.read::<Message>()?).is_err() {
-                    return Ok(());
+    let (events, received) = crossbeam_channel::bounded(16);
+    // Wake for a switch or the session ending, not on a timer.
+    link.notify(Some(events.clone()));
+    let _stopping = {
+        let events = events.clone();
+        lease.stop.register(move || {
+            let _ = events.try_send(Event::Changed);
+        })
+    };
+    let mut player = Player::new();
+    // Samples go straight into the buffer, so nothing else wakes per packet.
+    let reading = {
+        let buffer = player.buffer();
+        thread::Builder::new()
+            .name("seam-sound-receive".into())
+            .spawn(move || -> Result<()> {
+                let _priority = Realtime::enter();
+                loop {
+                    let event = match reader.read::<Message>()? {
+                        Message::Samples(samples) => {
+                            let mut buffer = buffer.lock().unwrap_or_else(PoisonError::into_inner);
+                            buffer.push(&samples);
+                            if !buffer.wants_speakers() {
+                                continue;
+                            }
+                            Event::Sound
+                        }
+                        Message::Pause => {
+                            buffer
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .pause();
+                            continue;
+                        }
+                        Message::Format { rate } => {
+                            buffer
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .set_rate(rate);
+                            Event::Message(Message::Format { rate })
+                        }
+                        message => Event::Message(message),
+                    };
+                    if events.send(event).is_err() {
+                        return Ok(());
+                    }
                 }
-            }
-        })?;
+            })?
+    };
     let _priority = responsive();
-    let mut player = playback::Player::new();
     let mut unavailable = None;
+    let mut wait = Duration::from_secs(3600);
     let result = loop {
         if lease.stop.is_stopped() || !link.is_on() {
             break Ok(());
         }
-        match received.recv_timeout(Duration::from_millis(200)) {
-            Ok(Message::Format { rate }) => {
+        match received.recv_timeout(wait) {
+            Ok(Event::Message(Message::Format { rate })) => {
                 unavailable = None;
                 log::info!("sound from {name}: {rate} Hz");
                 player.format(rate);
             }
-            Ok(Message::Samples(samples)) => player.samples(&samples),
-            Ok(Message::Pause) => player.pause(),
-            Ok(Message::Unavailable(reason)) => {
+            Ok(Event::Message(Message::Unavailable(reason))) => {
                 if unavailable.as_ref() != Some(&reason) {
                     log::info!("sound from {name} unavailable: {reason}");
                 }
                 unavailable = Some(reason);
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Ok(Event::Sound) => player.start(),
+            Ok(Event::Message(_) | Event::Changed) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break Ok(()),
         }
-        player.tick(name);
+        wait = player.tick(name);
         link.set_status(match (&unavailable, &player.problem) {
             (Some(reason), _) => Status::Unavailable(reason.clone()),
             (None, Some(problem)) => Status::Unavailable(problem.clone()),
@@ -309,6 +440,7 @@ fn connect(
             (None, None) => Status::Quiet,
         });
     };
+    link.notify(None);
     // Closing the connection stops the recording on the other computer.
     let _ = writer.shutdown();
     drop(player);
@@ -379,7 +511,7 @@ fn watch_hang_up(
 }
 
 fn send(writer: &mut SecureWriter, closed: &Signal, link: &Link) -> Result<()> {
-    let _priority = responsive();
+    let _priority = Realtime::enter();
     let host = cpal::default_host();
     while !closed.is_stopped() {
         let capture = match capture::Capture::start(&host) {
@@ -441,7 +573,7 @@ fn send(writer: &mut SecureWriter, closed: &Signal, link: &Link) -> Result<()> {
 /// Sends one recording's buffers, leaving out silence.
 struct Transmit {
     quantizer: dsp::Quantizer,
-    samples: Vec<i16>,
+    samples: Vec<u8>,
     /// Frames of silence in a row.
     silent: usize,
     hangover: usize,
@@ -536,7 +668,7 @@ mod tests {
         // Silence before any sound sends nothing.
         transmit.packet(&mut writer, &quiet).unwrap();
         transmit.packet(&mut writer, &tone).unwrap();
-        assert!(matches!(reader.read().unwrap(), Message::Samples(s) if s.len() == 960));
+        assert!(matches!(reader.read().unwrap(), Message::Samples(s) if s.len() == 960 * 2));
         // Silence within the hangover is still sent, so pauses keep their length.
         let within = (HANGOVER.as_millis() / 10 - 1) as usize;
         for _ in 0..within {
@@ -551,7 +683,7 @@ mod tests {
         transmit.idle(&mut writer).unwrap();
         transmit.packet(&mut writer, &tone).unwrap();
         // The next message after the pause is the sound itself.
-        assert!(matches!(reader.read().unwrap(), Message::Samples(s) if s.len() == 960));
+        assert!(matches!(reader.read().unwrap(), Message::Samples(s) if s.len() == 960 * 2));
         // A recording that stops delivering ends with one pause.
         transmit.idle(&mut writer).unwrap();
         transmit.idle(&mut writer).unwrap();
@@ -574,13 +706,25 @@ mod tests {
             .collect();
         transmit.packet(&mut writer, &long).unwrap();
         let mut received = 0;
-        while received < long.len() {
+        while received < long.len() * 2 {
             match reader.read().unwrap() {
                 Message::Samples(samples) => received += samples.len(),
                 other => panic!("{other:?}"),
             }
         }
-        assert_eq!(received, long.len());
+        assert_eq!(received, long.len() * 2);
+    }
+
+    #[test]
+    fn samples_travel_as_one_block_of_bytes() {
+        let (mut reader, mut writer) = connected();
+        reader.set_timeout(Duration::from_secs(2)).unwrap();
+        let samples: Vec<u8> = (0..=255).collect();
+        writer.write(&Message::Samples(samples.clone())).unwrap();
+        assert!(matches!(reader.read().unwrap(), Message::Samples(s) if s == samples));
+        // A length, then the bytes themselves: no per-sample framing.
+        let encoded = bincode::serialize(&Message::Samples(samples.clone())).unwrap();
+        assert_eq!(encoded.len(), 4 + 8 + samples.len());
     }
 
     #[test]

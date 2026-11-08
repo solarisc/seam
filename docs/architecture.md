@@ -101,22 +101,42 @@ The controlled computer records its default output device only while that
 connection is open (`sound/capture.rs`): WASAPI loopback on Windows, a Core
 Audio process tap on macOS 14.6 and later. It folds the recording to stereo,
 rounds it to 16 bits with triangular dither and sends it at its own sample
-rate in the buffers the system delivers, about 10 ms each. After 250 ms of
-silence it sends a pause and nothing more until sound returns. The Windows
-sign-in helper answers on its sound port that the computer is locked.
+rate, as one block of little-endian bytes per buffer the system delivers,
+about 10 ms each. After 250 ms of silence it sends a pause and nothing more
+until sound returns; while paused, silent buffers are dropped as they are
+recorded. The Windows sign-in helper answers on its sound port that the
+computer is locked.
 
-The controlling computer plays through its default output device
-(`sound/playback.rs`). Samples wait in a buffer that starts at 25 ms beyond
-what the speakers first ask for, grows by 10 ms whenever it runs dry and
-shrinks by 5 ms, down to 15 ms, after a while without; that while doubles each
-time it runs dry. The speakers' callback converts in 128-frame steps: a
-crossfaded frame slip when both computers use the same rate, a sinc
-resampler otherwise. It leans the rate by up to 0.5 % to hold the buffer at
-its target, which follows the drift between the two audio clocks. The
-speakers close after 30 seconds of quiet and reopen with the next sound;
-either computer follows a change of default device within a second. Sound
-threads run at the same raised priority as input's, and the audio callbacks
-at real-time priority.
+The controlling computer plays through its default output device. On
+Windows (`sound/push.rs`, `sound/wasapi.rs`) the network thread converts
+each packet as it arrives and writes it straight into the speakers'
+shared-mode buffer, so sound waits in no other buffer and no thread wakes on
+a timer to feed the speakers. When a sound starts, the buffer is topped up
+with silence to the target, so it starts no later than it continues. On
+macOS (`sound/playback.rs`) the speakers ask for sound, and their callback
+takes it from a buffer the network thread fills. Either way the conversion
+is a crossfaded frame slip when both computers use the same rate, and a sinc
+resampler otherwise, and it leans the rate by up to 0.5 % to hold the buffer
+at its target, which follows the drift between the two audio clocks.
+
+The target is as short as the network allows (`sound/pacing.rs`). Sound
+arrives in the sender's buffers and leaves in the speakers', about 10 ms
+each, and as the two clocks drift the speakers now and then find no new
+packet. So every 2 seconds of playing, the buffer checks two things over the
+last 10 seconds: that a typical low point (the tenth percentile) still held a
+packet plus a margin, and that the lowest held the margin. Short of either,
+the target grows at once; with room to spare, and the buffer settled, it
+shrinks by up to 2 ms. The margin starts at 4 ms and widens by 3 ms each time
+the buffer runs dry. On a steady wired network between two Windows
+computers, sound plays here about 30 ms after it plays there.
+
+After 2 seconds with nothing to play, the speakers pause, which costs
+nothing, and resume when sound arrives; after 10 minutes paused they close.
+The worker that manages them wakes only for that, a switch, or once a second
+while sound plays, when it also follows a change of default device. The
+threads that send and that play sound run at real-time audio priority (Pro
+Audio on Windows, a time-constraint thread on macOS), as the audio callbacks
+do.
 
 ## Windows sign-in and lock screens
 

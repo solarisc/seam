@@ -27,6 +27,8 @@ clipboard-rs = "0.3.5"
 # Records a controlled computer's sound and plays it on the controlling one.
 # `realtime` runs the audio threads at real-time priority (MMCSS on Windows).
 cpal = { version = "0.18.2", features = ["realtime"] }
+# The same real-time scheduling for the threads that send and play sound.
+audio_thread_priority = { version = "0.35", default-features = false }
 crossbeam-channel = "0.5"
 data-encoding = "2.9"
 dirs = "6.0"
@@ -56,6 +58,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 clipboard-win = "5.4.1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_NetworkManagement_QoS", "Win32_Networking_WinSock", "Win32_System_DataExchange", "Win32_Security", "Win32_System_RemoteDesktop", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_System_Power", "Win32_Graphics_Dwm", "Win32_UI_Controls", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Kernel"] }
 windows-service = "0.8"
+# Writes sound straight into the speakers' buffer. The version cpal uses.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_Media_KernelStreaming", "Win32_Media_Multimedia", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant"] }
 raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.build-dependencies]
