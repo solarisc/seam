@@ -23,6 +23,7 @@ pub mod protocol;
 pub mod service;
 mod session;
 pub mod shutdown;
+pub mod sound;
 pub mod status;
 #[cfg(target_os = "windows")]
 mod windows_capture;

@@ -65,6 +65,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 	<key>LSMinimumSystemVersion</key><string>11.0</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSLocalNetworkUsageDescription</key><string>Seam finds and connects to your other computers on this network.</string>
+	<key>NSAudioCaptureUsageDescription</key><string>Seam plays this Mac's sound on the computer that controls it, while you have that turned on there.</string>
 </dict>
 </plist>
 PLIST

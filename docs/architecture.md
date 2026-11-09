@@ -33,18 +33,19 @@ All ports derive from `listen_port` (default 47843):
 | `+2` (TCP, localhost) | Commands from the settings window and tray |
 | `+3` (TCP) | Pairing requests |
 | `+3` (UDP) | Discovery beacons |
+| `+4` (TCP) | A controlled computer's sound, bound to the input session |
 
-Input and clipboard use separate connections so a large copy never delays the
-pointer. Both are encrypted with the Noise `NNpsk0` pattern keyed by the
-receiving computer's 128-bit pairing secret. `NNpsk0`'s first message can be
+Input, clipboard and sound use separate connections so a large copy never
+delays the pointer or the sound. All are encrypted with the Noise `NNpsk0`
+pattern keyed by the receiving computer's 128-bit pairing secret. `NNpsk0`'s first message can be
 replayed by anyone who recorded it, so the connecting computer follows the
 handshake with a message encrypted under the new session key, and the
 receiving computer accepts the connection only once that decrypts
 (`network.rs`). Each handshake must finish within 3 seconds as a whole,
 whatever the pace of individual reads.
 
-The Windows sign-in helper (below) uses `listen_port + 10` to `+ 12` in the
-same way.
+The Windows sign-in helper (below) uses `listen_port + 10` to `+ 12` and
+`+ 14` in the same way.
 
 ## Pairing
 
@@ -89,6 +90,78 @@ Pointer motion is coalesced, never delayed: only positions already waiting
 are merged. Keys, buttons and scrolls keep their order. When control returns
 or a connection drops, held keys and buttons are released on the computer
 that received them.
+
+## Sound
+
+While **Play its sound here** is on for a controlled computer, the
+controlling computer keeps a connection open to that computer's sound port,
+bound to the input session like the clipboard's (`sound/mod.rs`). The switch
+is a live command to the agent, which also saves it; no restart is needed.
+The controlled computer records only while that connection is open
+(`sound/capture.rs`). On Windows (`sound/loopback.rs`) each app can pick its
+own output device, so every device that plays is recorded through WASAPI
+loopback, which adds no delay, as 48 kHz stereo, and the recordings are mixed
+(`sound/mix.rs`). Each device's level meter, read ten times a second, shows
+which play, and a device stays recorded for a minute after it last played, so
+its next sound starts on time. One device leads: its sound goes out the
+moment it arrives. The others' waits just long enough to be there whenever
+the leader's arrives (one packet of their own and 2 ms), matched to the
+leader's clock by a crossfaded frame slip. Windows can also record every app
+at once (process loopback), but holds that sound back by about 40 ms. A Mac
+records its default output device through a Core Audio process tap on macOS
+14.6 and later, folded to stereo. The recording is rounded to 16 bits with
+triangular dither and sent at its own sample rate, as one block of
+little-endian bytes per buffer the system delivers, about 10 ms each. After 250 ms of silence it sends a pause and nothing more
+until sound returns; while paused, silent buffers are dropped as they are
+recorded. The Windows sign-in helper answers on its sound port that the
+computer is locked.
+
+The controlling computer plays through its default output device. On
+Windows (`sound/push.rs`, `sound/wasapi.rs`) the network thread converts
+each packet as it arrives and writes it straight into the speakers'
+shared-mode buffer, so sound waits in no other buffer and no thread wakes on
+a timer to feed the speakers. When a sound starts, the buffer is topped up
+with silence to the target, so it starts no later than it continues. On
+macOS (`sound/playback.rs`) the speakers ask for sound, and their callback
+takes it from a buffer the network thread fills. Either way the conversion
+is a crossfaded frame slip when both computers use the same rate, and a sinc
+resampler otherwise, and it leans the rate by up to 0.5 % to hold the buffer
+at its target, which follows the drift between the two audio clocks.
+
+The target is as short as the network allows (`sound/pacing.rs`). Sound
+arrives in the sender's buffers and leaves in the speakers', about 10 ms
+each, and as the two clocks drift the speakers now and then find no new
+packet. So every 2 seconds of playing, the buffer checks two things over the
+last 10 seconds: that a typical low point (the tenth percentile) still held a
+packet plus a margin, and that the lowest held the margin. Short of either,
+the target grows at once; with room to spare, and the buffer settled, it
+shrinks by up to 2 ms. The margin starts at 4 ms and widens by 3 ms each time
+the buffer runs dry.
+
+A packet is held in reserve only because one that arrives just before the
+speakers take sound misses that take when it comes a little late. On
+Windows the speakers' clock tells when they next take sound, so each packet's
+time to spare is known. It is counted from where packets usually arrive, so
+one late enough to miss its take counts as having less than none, rather
+than as early for the next. The reserve is held as soon as a packet comes
+within 2 ms of a take, and let go once every packet for 5 minutes has kept
+more than 3 ms clear (some devices deliver a packet late only every minute
+or two), which saves one speaker period (usually 10 ms). The two clocks
+drift, so this changes over minutes. The speakers take a whole period at a
+time, so the reserve is one period, however much arrives at once, and the
+margin there starts at 2 ms, only for packets of uneven size and the leaning
+of the rate; running dry widens it by 1 ms, for a minute.
+On a steady wired network between two Windows computers, sound plays here
+about 15 ms after it plays there while a packet is held in reserve, and
+sooner while packets fall clear of the takes.
+
+After 2 seconds with nothing to play, the speakers pause, which costs
+nothing, and resume when sound arrives; after 10 minutes paused they close.
+The worker that manages them wakes only for that, a switch, or once a second
+while sound plays, when it also follows a change of default device. The
+threads that send and that play sound run at real-time audio priority (Pro
+Audio on Windows, a time-constraint thread on macOS), as the audio callbacks
+do.
 
 ## Windows sign-in and lock screens
 

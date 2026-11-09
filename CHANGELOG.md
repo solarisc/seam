@@ -1,6 +1,35 @@
 # Changelog
 
-## Unreleased
+## 1.1.0
+
+Sound from the computers you control, and better handling of display
+changes on a Mac.
+
+### Install
+
+- **Windows 10 or 11:** download `Seam-1.1.0-windows-setup.exe` below and
+  run it; it updates an earlier version in place, keeping your settings and
+  pairings. The setup program isn't signed yet; if SmartScreen appears,
+  choose **More info → Run anyway**. `SHA256SUMS.txt` has its checksum.
+- **macOS 11 or later:** releases don't include the Mac app yet. Build it
+  from source with `scripts/build-macos.sh --install`; see
+  [Build from source](https://github.com/solarisc/seam#build-from-source).
+
+Update Seam on every computer: playing a computer's sound elsewhere needs
+1.1.0 on both.
+
+### Added
+
+- **Sound from the computers you control.** Turn on **Play its sound here**
+  under a computer on the **Screens** page to hear it through the speakers
+  or headphones of the computer you're using. The switch works at once,
+  without restarting sharing. Sound is sent uncompressed over its own
+  encrypted connection, only while something plays, and stays in step with
+  a delay of a few hundredths of a second. A Windows computer shares every
+  app's sound, whichever speakers or headphones it plays on. Both computers
+  need this version.
+  A Mac shares its sound on macOS 14.6 or later, once it's allowed under
+  **Privacy & Security → Screen & System Audio Recording**.
 
 ### Fixed
 

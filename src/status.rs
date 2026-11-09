@@ -52,6 +52,9 @@ pub struct LinkStatus {
     pub sent_events: u64,
     pub received_events: u64,
     pub last_error: String,
+    /// The controlled computer's sound: played here, or sent from here.
+    #[serde(default)]
+    pub sound: crate::sound::Status,
 }
 
 impl LinkStatus {
@@ -144,6 +147,7 @@ impl Stats {
             sent_events: controller.sent_events.load(Ordering::Relaxed),
             received_events: self.received_events.load(Ordering::Relaxed),
             last_error: self.last_error.read().unwrap().clone(),
+            sound: crate::sound::Status::Off,
         }
     }
 }
@@ -156,6 +160,7 @@ pub(crate) struct LinkHandle {
     /// For a computer this one connects to: the pairing hint in its beacons,
     /// and the alarm its connection thread waits on.
     pub beacon: Option<(String, Arc<crate::wake::Alarm>)>,
+    pub sound: Arc<crate::sound::Link>,
 }
 
 /// Agent-wide state reported to the settings window.
@@ -209,6 +214,7 @@ impl Status {
                 .map(|link| {
                     let mut status = link.stats.snapshot(link.peer, &link.controller);
                     status.layout = Some(link.layouts.report());
+                    status.sound = link.sound.status();
                     status
                 })
                 .collect(),
@@ -227,6 +233,25 @@ impl Status {
             .map(|link| &link.layouts)
             .context("That computer is not part of the running configuration")
     }
+
+    /// Play a controlled computer's sound here or stop, at once, and keep
+    /// the choice for next time.
+    fn set_sound(&self, peer: usize, on: bool, code: &str) -> Result<()> {
+        let link = self
+            .links
+            .iter()
+            .find(|link| link.peer == Some(peer))
+            .context("That computer is not part of the running configuration")?;
+        link.sound.set(on);
+        crate::config::edit(|saved| {
+            // Matched by its secret: the list may have changed since.
+            if let Some(saved) = saved.peers.iter_mut().find(|saved| saved.code == code) {
+                saved.sound = on;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -243,6 +268,10 @@ enum Command {
     AnswerPairing {
         id: u64,
         accept: bool,
+    },
+    SetSound {
+        peer: usize,
+        on: bool,
     },
 }
 
@@ -327,6 +356,13 @@ pub(crate) fn serve(
                         .map_err(anyhow::Error::msg)
                 })())?,
                 Command::AnswerPairing { id, accept } => reply(status.pairing.answer(id, accept))?,
+                Command::SetSound { peer, on } => reply(
+                    config
+                        .peers
+                        .get(peer)
+                        .context("That computer is not part of the running configuration")
+                        .and_then(|saved| status.set_sound(peer, on, &saved.code)),
+                )?,
             },
             _ => reply::<()>(Err(anyhow::anyhow!("unauthorized")))?,
         };
@@ -435,6 +471,11 @@ impl Agent<'_> {
             Duration::from_secs(3),
         )
     }
+
+    /// Play controlled computer `peer`'s sound here, or stop.
+    pub fn set_sound(&self, peer: usize, on: bool) -> Result<()> {
+        self.call(Command::SetSound { peer, on }, Duration::from_secs(3))
+    }
 }
 
 #[cfg(test)]
@@ -502,5 +543,11 @@ mod tests {
         assert_eq!(request["command"], "answer-pairing");
         assert_eq!(request["id"], 7);
         assert_eq!(request["accept"], true);
+        let (config, server) = fake_agent(r#"{"ok":null}"#);
+        agent(&config).set_sound(1, true).unwrap();
+        let request = server.join().unwrap();
+        assert_eq!(request["command"], "set-sound");
+        assert_eq!(request["peer"], 1);
+        assert_eq!(request["on"], true);
     }
 }

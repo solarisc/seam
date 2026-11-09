@@ -1,4 +1,5 @@
-//! Admission and retirement shared by input and its authenticated data worker.
+//! Admission and retirement shared by input and the authenticated workers
+//! bound to it: clipboard and sound.
 use crate::{
     input::Controller,
     network::{SecureConnection, SecureReader, SecureWriter},
@@ -23,39 +24,66 @@ const DATA_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// input out until Seam restarts.
 const DATA_CLEANUP_LIMIT: Duration = Duration::from_secs(10);
 
+/// A connection bound to an input session besides input itself. Each input
+/// session has at most one worker of each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Channel {
+    /// Clipboard and file transfers.
+    Data,
+    /// A controlled computer's sound.
+    Sound,
+}
+
+impl Channel {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
 struct DataWorker {
     stop: Arc<Signal>,
     socket: Option<TcpStream>,
+}
+
+impl DataWorker {
+    fn cancel(&self) {
+        self.stop.stop();
+        if let Some(socket) = &self.socket {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
 }
 
 struct Active {
     binding: [u8; 32],
     socket: TcpStream,
     input_finished: bool,
-    /// When input finished, while its data worker may still be stopping.
+    /// When input finished, while its workers may still be stopping.
     finished_at: Option<Instant>,
     retiring: bool,
-    data: Option<DataWorker>,
+    /// Indexed by `Channel`.
+    workers: [Option<DataWorker>; 2],
 }
 
 impl Active {
     fn cancel(&mut self) {
         self.retiring = true;
         let _ = self.socket.shutdown(Shutdown::Both);
-        if let Some(data) = &self.data {
-            data.stop.stop();
-            if let Some(socket) = &data.socket {
-                let _ = socket.shutdown(Shutdown::Both);
-            }
+        for worker in self.workers.iter().flatten() {
+            worker.cancel();
         }
+    }
+
+    fn idle(&self) -> bool {
+        self.workers.iter().all(Option::is_none)
     }
 }
 
 #[derive(Default)]
 struct State {
     active: Option<Active>,
-    /// A finished session whose data worker outlived `DATA_CLEANUP_LIMIT`.
-    /// Input goes on without it; no new data worker starts until it stops.
+    /// A finished session whose workers outlived `DATA_CLEANUP_LIMIT`.
+    /// Input goes on without it; no new worker starts until they stop.
     lingering: Option<Active>,
     resetting: bool,
     stopping: bool,
@@ -121,18 +149,18 @@ impl Control {
             input_finished: false,
             finished_at: None,
             retiring: false,
-            data: None,
+            workers: [None, None],
         });
         Ok(Lease(self.clone()))
     }
 
-    /// A data worker from an earlier connection is still stopping, so this
-    /// connection's clipboard has to wait for it.
+    /// A worker from an earlier connection is still stopping, so this
+    /// connection's clipboard and sound have to wait for it.
     pub fn data_lingering(&self) -> bool {
         self.state.lock().unwrap().lingering.is_some()
     }
 
-    pub fn reserve_data(self: &Arc<Self>, binding: [u8; 32]) -> Result<DataLease> {
+    pub fn reserve(self: &Arc<Self>, binding: [u8; 32], channel: Channel) -> Result<DataLease> {
         let mut state = self.state.lock().unwrap();
         ensure!(!state.stopping && !state.resetting, "session is stopping");
         ensure!(
@@ -147,25 +175,41 @@ impl Control {
             !active.retiring && active.binding == binding,
             "data belongs to a retired input session"
         );
+        let slot = &mut active.workers[channel.index()];
         ensure!(
-            active.data.is_none(),
-            "input session already has a data worker"
+            slot.is_none(),
+            "input session already has a {channel:?} worker"
         );
         let stop = Arc::new(Signal::default());
-        active.data = Some(DataWorker {
+        *slot = Some(DataWorker {
             stop: stop.clone(),
             socket: None,
         });
         Ok(DataLease {
             control: self.clone(),
             binding,
+            channel,
             stop,
         })
+    }
+
+    pub fn reserve_data(self: &Arc<Self>, binding: [u8; 32]) -> Result<DataLease> {
+        self.reserve(binding, Channel::Data)
     }
 
     pub fn accept_data(
         self: &Arc<Self>,
         connection: SecureConnection,
+    ) -> Result<(SecureReader, SecureWriter, DataLease)> {
+        self.accept(connection, Channel::Data)
+    }
+
+    /// Admit a connection the controlling computer opened for `channel`, once
+    /// it proves which input session it belongs to.
+    pub fn accept(
+        self: &Arc<Self>,
+        connection: SecureConnection,
+        channel: Channel,
     ) -> Result<(SecureReader, SecureWriter, DataLease)> {
         let socket = connection.cancellation_socket()?;
         let (mut reader, mut writer) = connection.split()?;
@@ -176,7 +220,7 @@ impl Control {
             hello.version == PROTOCOL_VERSION,
             "data protocol version mismatch"
         );
-        let lease = self.reserve_data(hello.input)?;
+        let lease = self.reserve(hello.input, channel)?;
         lease.attach_socket(&socket)?;
         writer.write(&hello)?;
         reader.clear_timeout()?;
@@ -228,7 +272,7 @@ impl Control {
         if state
             .active
             .as_ref()
-            .is_some_and(|active| active.input_finished && active.data.is_none())
+            .is_some_and(|active| active.input_finished && active.idle())
         {
             state.active = None;
             self.finished.notify_all();
@@ -254,6 +298,7 @@ impl Drop for Lease {
 pub(crate) struct DataLease {
     control: Arc<Control>,
     binding: [u8; 32],
+    channel: Channel,
     pub stop: Arc<Signal>,
 }
 
@@ -268,8 +313,7 @@ impl DataLease {
             !active.retiring && active.binding == self.binding,
             "input session ended"
         );
-        let data = active
-            .data
+        let data = active.workers[self.channel.index()]
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("data worker ended"))?;
         if let Some(old) = data.socket.replace(socket.try_clone()?) {
@@ -304,22 +348,21 @@ impl DataLease {
 impl Drop for DataLease {
     fn drop(&mut self) {
         let mut state = self.control.state.lock().unwrap();
-        if state
-            .lingering
-            .as_ref()
-            .is_some_and(|old| old.binding == self.binding)
+        let index = self.channel.index();
+        if let Some(old) = &mut state.lingering
+            && old.binding == self.binding
         {
-            log::info!("the last connection's clipboard stopped");
-            state.lingering = None;
+            old.workers[index] = None;
+            if old.idle() {
+                log::info!("the last connection finished stopping");
+                state.lingering = None;
+            }
         }
         if let Some(active) = &mut state.active
             && active.binding == self.binding
-            && let Some(data) = active.data.take()
+            && let Some(worker) = active.workers[index].take()
         {
-            data.stop.stop();
-            if let Some(socket) = data.socket {
-                let _ = socket.shutdown(Shutdown::Both);
-            }
+            worker.cancel();
         }
         self.control.finish_if_retired(&mut state);
     }
