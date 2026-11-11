@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Copied files are sent when you paste them.** Copying files or folders
+  sent them to the other computers at once, even while you went on working
+  on the computer you copied them on. Now the other computers only learn
+  what was copied, their names and sizes, and a file is sent when you paste
+  it on one of them. File Explorer shows its usual copy progress while the
+  files arrive, and a Mac finishes the paste once they have. The computer
+  you control others from passes files between them the same way, fetching
+  them only when they are pasted. On Windows, files from another computer
+  paste into File Explorer and into apps that take files pasted from Remote
+  Desktop. Update Seam on every computer: this version doesn't connect to
+  earlier ones.
+
 ## 1.1.0
 
 Sound from the computers you control, and better handling of display

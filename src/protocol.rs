@@ -1,7 +1,7 @@
 use rdev::Key;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const DEFAULT_PORT: u16 = 47843;
 pub const MAX_WIRE_SIZE: usize = 65_535;
 pub const FILE_CHUNK_SIZE: usize = 60 * 1024;
@@ -162,6 +162,15 @@ pub enum Input {
     },
 }
 
+/// A file or folder among offered files.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct OfferedEntry {
+    /// Its path within the copy, folders separated by `/`.
+    pub path: String,
+    /// The file's size; `None` for a folder.
+    pub bytes: Option<u64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Data {
     Text(String),
@@ -229,5 +238,19 @@ pub enum Data {
     TransferFailed {
         id: u64,
         reason: String,
+    },
+    /// Files were copied on the sender, listed in walk order: each folder
+    /// before what it holds. A long list takes several messages, the last
+    /// marked `last`. None of the files is sent until a paste on the
+    /// receiver asks for them.
+    FilesOffer {
+        id: u64,
+        entries: Vec<OfferedEntry>,
+        last: bool,
+    },
+    /// A paste on the receiver wants offered files `id`. The sender answers
+    /// with a batch of the same `id`, or `BatchAbort` when it can't.
+    FilesWanted {
+        id: u64,
     },
 }

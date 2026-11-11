@@ -44,8 +44,12 @@ pub(super) fn publish(source: u64, job: Job) {
         let enabled = match job {
             Job::Text(_) => link.text,
             Job::Image { .. } => link.images,
-            Job::Files { .. } => link.files,
-            Job::Receipt(_) | Job::Refusal { .. } => false,
+            Job::Files { .. } | Job::Promised(_) => link.files,
+            Job::Receipt(_)
+            | Job::Refusal { .. }
+            | Job::Want(_)
+            | Job::Upload { .. }
+            | Job::Withdrawn(_) => false,
         };
         if enabled && let Some(outgoing) = link.outgoing.upgrade() {
             outgoing.submit(job.clone());
