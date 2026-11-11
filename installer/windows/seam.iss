@@ -1,5 +1,5 @@
 ; Seam installer for Windows. Build with Inno Setup 6:
-;   iscc /DVersion=1.1.0 /DSource=..\..\target\release installer\windows\seam.iss
+;   iscc /DVersion=1.2.0 /DSource=..\..\target\release installer\windows\seam.iss
 ;
 ; Unattended use:
 ;   Seam-<version>-windows-setup.exe /VERYSILENT /SUPPRESSMSGBOXES
