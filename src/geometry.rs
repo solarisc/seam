@@ -25,19 +25,81 @@ pub struct Geometry {
     pub keep_corners: bool,
 }
 
+/// The display a seam on `side` of a computer's desktop uses: `chosen`, or
+/// the display beyond it when another of the computer's displays covers at
+/// least half of `chosen`'s edge on that side, repeated until an edge is
+/// mostly open. The pointer can't leave across a covered edge, so a seam
+/// always meets the outside of the desktop, wherever displays are moved.
+pub fn seam_display<'a>(monitors: &'a [Monitor], chosen: &'a Monitor, side: Side) -> &'a Monitor {
+    let mut display = chosen;
+    // Each step moves the edge strictly outward, so this ends; the bound
+    // only guards against a malformed display list.
+    for _ in 0..monitors.len() {
+        match covering(monitors, display, side) {
+            Some(next) => display = next,
+            None => break,
+        }
+    }
+    display
+}
+
+/// The chosen display (or the main one, when none is chosen or it is gone),
+/// moved to the outside of the desktop as `seam_display` does.
+pub fn select_seam_display(
+    monitors: &[Monitor],
+    chosen: Option<u32>,
+    side: Side,
+) -> Option<&Monitor> {
+    let display = monitors
+        .iter()
+        .find(|m| Some(m.id) == chosen)
+        .or_else(|| monitors.iter().find(|m| m.primary))
+        .or_else(|| monitors.first())?;
+    Some(seam_display(monitors, display, side))
+}
+
+/// The display that covers at least half of `display`'s edge on `side`, the
+/// one covering most of it when several do.
+fn covering<'a>(monitors: &'a [Monitor], display: &Monitor, side: Side) -> Option<&'a Monitor> {
+    let (start, end) = match side {
+        Side::Left | Side::Right => (i64::from(display.y), display.bottom() as i64),
+        Side::Top | Side::Bottom => (i64::from(display.x), display.right() as i64),
+    };
+    let length = end - start;
+    monitors
+        .iter()
+        .filter(|m| m.id != display.id && m.width > 0 && m.height > 0)
+        .filter(|m| match side {
+            // The display holds the first row or column beyond the edge.
+            Side::Right => m.contains(display.right(), m.y as f64),
+            Side::Left => m.contains(display.x as f64 - 1.0, m.y as f64),
+            Side::Top => m.contains(m.x as f64, display.y as f64 - 1.0),
+            Side::Bottom => m.contains(m.x as f64, display.bottom()),
+        })
+        .filter_map(|m| {
+            let (from, to) = match side {
+                Side::Left | Side::Right => (i64::from(m.y), m.bottom() as i64),
+                Side::Top | Side::Bottom => (i64::from(m.x), m.right() as i64),
+            };
+            let shared = to.min(end) - from.max(start);
+            (shared * 2 >= length && shared > 0).then_some((shared, m))
+        })
+        // The most covered; between equals, the lowest id, so both
+        // computers pick the same display.
+        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.id.cmp(&a.1.id)))
+        .map(|(_, m)| m)
+}
+
 impl Geometry {
+    /// Each side's seam display is the chosen one moved to the outside of its
+    /// desktop (see `seam_display`), so a seam never sits on an edge another
+    /// display covers.
     pub fn new(arrangement: &Arrangement, local: &[Monitor], remote: &[Monitor]) -> Option<Self> {
-        let select = |monitors: &[Monitor], selected: Option<u32>| {
-            monitors
-                .iter()
-                .find(|m| Some(m.id) == selected)
-                .or_else(|| monitors.iter().find(|m| m.primary))
-                .or_else(|| monitors.first())
-                .cloned()
-        };
+        let side = arrangement.side;
         Some(Self {
-            local: select(local, arrangement.local_monitor)?,
-            remote: select(remote, arrangement.remote_monitor)?,
+            local: select_seam_display(local, arrangement.local_monitor, side)?.clone(),
+            remote: select_seam_display(remote, arrangement.remote_monitor, side.opposite())?
+                .clone(),
             all_local: local.to_vec(),
             all_remote: remote.to_vec(),
             side: arrangement.side,
@@ -271,16 +333,20 @@ mod tests {
     }
     #[test]
     fn local_neighbor_blocks_transition() {
+        // A small display beside part of the seam display's edge: the
+        // pointer crosses above and below it, not into it.
         let g = Geometry::new(
             &Arrangement::default(),
             &[
                 monitor(1, 0, 0, 1920, 1080),
-                monitor(3, 1920, 0, 1920, 1080),
+                monitor(3, 1920, 200, 1024, 400),
             ],
             &[monitor(2, 0, 0, 1920, 1080)],
         )
         .unwrap();
-        assert_eq!(g.enter(1919.0, 500.0, 6.0, 0.0), None);
+        assert_eq!(g.local.id, 1);
+        assert_eq!(g.enter(1919.0, 400.0, 6.0, 0.0), None);
+        assert!(g.enter(1919.0, 800.0, 6.0, 0.0).is_some());
     }
 
     #[test]
@@ -295,6 +361,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(g.local_park_corner(), (4479.0, 1439.0));
+    }
+
+    #[test]
+    fn a_seam_on_a_covered_edge_moves_to_the_outside_of_the_desktop() {
+        // Three displays in a row; the chosen one is the middle.
+        let row = [
+            monitor(1, 0, 0, 1920, 1080),
+            monitor(2, 1920, 0, 1920, 1080),
+            monitor(3, 3840, 0, 1920, 1080),
+        ];
+        assert_eq!(seam_display(&row, &row[1], Side::Left).id, 1);
+        assert_eq!(seam_display(&row, &row[0], Side::Right).id, 3);
+        assert_eq!(seam_display(&row, &row[1], Side::Top).id, 2);
+        // The main display stands in when nothing is chosen.
+        assert_eq!(select_seam_display(&row, None, Side::Right).unwrap().id, 3);
+        assert_eq!(
+            select_seam_display(&row, Some(9), Side::Left).unwrap().id,
+            1
+        );
+        assert!(select_seam_display(&[], None, Side::Left).is_none());
+    }
+
+    #[test]
+    fn an_edge_mostly_open_keeps_its_seam() {
+        // A small display covers less than half of the large one's right
+        // edge, so the pointer still crosses above and below it.
+        let local = [
+            monitor(1, 0, 0, 3840, 2160),
+            monitor(2, 3840, 1000, 1280, 800),
+        ];
+        assert_eq!(seam_display(&local, &local[0], Side::Right).id, 1);
+        // Covering half or more moves the seam.
+        let local = [
+            monitor(1, 0, 0, 1920, 1080),
+            monitor(2, 1920, 540, 1920, 1080),
+        ];
+        assert_eq!(seam_display(&local, &local[0], Side::Right).id, 2);
+        // Displays only touching at a corner don't cover each other.
+        let local = [
+            monitor(1, 0, 0, 1920, 1080),
+            monitor(2, 1920, 1080, 1920, 1080),
+        ];
+        assert_eq!(seam_display(&local, &local[0], Side::Right).id, 1);
+    }
+
+    #[test]
+    fn the_pointer_crosses_where_the_seam_moved() {
+        // Arranged on the left of the right-hand display, which the
+        // left-hand display covers; the other computer's chosen display is
+        // its right-hand one, whose left edge its other display covers.
+        let local = [
+            monitor(1, 0, 0, 1920, 1080),
+            monitor(3, 1920, 0, 1920, 1080),
+        ];
+        let remote = [monitor(5, 0, 0, 1440, 900), monitor(6, 1440, 0, 1920, 1080)];
+        let arrangement = Arrangement {
+            local_monitor: Some(3),
+            remote_monitor: Some(5),
+            ..Arrangement::on(Side::Left)
+        };
+        let g = Geometry::new(&arrangement, &local, &remote).unwrap();
+        assert_eq!((g.local.id, g.remote.id), (1, 6));
+        let entered = g.enter(4.0, 540.0, -6.0, 0.0).unwrap();
+        assert!(g.remote.contains(entered.0, entered.1));
+        // The other computer, arranged the mirrored way, agrees.
+        let mirrored = Arrangement {
+            local_monitor: Some(5),
+            remote_monitor: Some(3),
+            ..Arrangement::on(Side::Right)
+        };
+        let m = Geometry::new(&mirrored, &remote, &local).unwrap();
+        assert_eq!((m.local.id, m.remote.id), (6, 1));
     }
 
     #[test]

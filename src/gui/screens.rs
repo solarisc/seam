@@ -112,25 +112,15 @@ impl App {
                                     .font(theme::strong(13.5))
                                     .color(p.text),
                             );
-                            if arrangement::edge_blocked(&local, &computer.arrangement) {
-                                ui.label(
-                                    RichText::new(
-                                        "Another display covers this edge, so the pointer can't cross. Drag it to an outer edge.",
-                                    )
-                                    .font(theme::small())
-                                    .color(p.danger),
-                                );
-                            } else {
-                                widgets::muted(
-                                    ui,
-                                    describe(
-                                        link,
-                                        &computer.name,
-                                        computer.key.is_none(),
-                                        &self.running_text(),
-                                    ),
-                                );
-                            }
+                            widgets::muted(
+                                ui,
+                                describe(
+                                    link,
+                                    &computer.name,
+                                    computer.key.is_none(),
+                                    &self.running_text(),
+                                ),
+                            );
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if let Some(link) = link.filter(|l| l.connected) {
@@ -141,8 +131,7 @@ impl App {
                         });
                     });
                     let gone = gone_displays(link, &local);
-                    if local.len() > 1 || computer.monitors.len() > 1 || gone.local || gone.remote
-                    {
+                    if local.len() > 1 || computer.monitors.len() > 1 || gone.local || gone.remote {
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             ui.add_space(18.0);
@@ -594,6 +583,7 @@ fn display_pickers(
                 ("local", computer.key),
                 local,
                 selected(gone.local, computer.arrangement.local_monitor),
+                computer.arrangement.side,
             ) {
                 choice = Some(Choice::Local(id));
             }
@@ -606,6 +596,7 @@ fn display_pickers(
                 ("remote", computer.key),
                 &computer.monitors,
                 selected(gone.remote, computer.arrangement.remote_monitor),
+                computer.arrangement.side.opposite(),
             ) {
                 choice = Some(Choice::Remote(id));
             }
@@ -614,16 +605,39 @@ fn display_pickers(
     choice
 }
 
+/// A choice of the display a seam meets, on the computer whose displays are
+/// `monitors`; `side` is the edge of that computer's desktop the seam is on.
+/// A display whose edge there another display covers is shown but can't be
+/// chosen: the seam would move to the display beyond it anyway.
 fn picker(
     ui: &mut Ui,
     salt: impl std::hash::Hash,
     monitors: &[Monitor],
     selected: Option<u32>,
+    side: Side,
 ) -> Option<Option<u32>> {
     let name = |id: Option<u32>| match id.and_then(|id| monitors.iter().find(|m| m.id == id)) {
         Some(m) => display_name(m),
         None if id.is_some() => "Disconnected display".into(),
         None => "Main display".into(),
+    };
+    // A choice whose edge is covered (saved before displays moved) shows the
+    // display the seam meets instead, the one the picture and pointer use.
+    let selected = match selected {
+        Some(id) if monitors.iter().any(|m| m.id == id) => {
+            crate::geometry::select_seam_display(monitors, selected, side).map(|m| m.id)
+        }
+        None => {
+            let main = monitors
+                .iter()
+                .find(|m| m.primary)
+                .or_else(|| monitors.first())
+                .map(|m| m.id);
+            crate::geometry::select_seam_display(monitors, None, side)
+                .map(|seam| seam.id)
+                .filter(|&seam| Some(seam) != main)
+        }
+        gone => gone,
     };
     let mut value = selected;
     egui::ComboBox::from_id_salt(salt)
@@ -632,7 +646,14 @@ fn picker(
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut value, None, "Main display");
             for monitor in monitors {
-                ui.selectable_value(&mut value, Some(monitor.id), display_name(monitor));
+                let open = crate::geometry::seam_display(monitors, monitor, side).id == monitor.id;
+                ui.add_enabled_ui(open, |ui| {
+                    ui.selectable_value(&mut value, Some(monitor.id), display_name(monitor))
+                        .on_disabled_hover_text(format!(
+                            "Another display covers its {} edge",
+                            edge_name(side)
+                        ));
+                });
             }
         });
     (value != selected).then_some(value)
@@ -680,6 +701,15 @@ fn sharing_sound(link: &LinkStatus) -> Option<&'static str> {
             Some("This computer's sound can't be shared. The computer controlling it shows why.")
         }
         SoundStatus::Off | SoundStatus::Connecting => None,
+    }
+}
+
+fn edge_name(side: Side) -> &'static str {
+    match side {
+        Side::Left => "left",
+        Side::Right => "right",
+        Side::Top => "top",
+        Side::Bottom => "bottom",
     }
 }
 

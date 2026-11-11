@@ -52,12 +52,16 @@ impl Layout {
         }
     }
 
+    /// The layout both computers install: concrete displays, each moved to
+    /// the outside of its desktop when another display covers the chosen
+    /// one's edge (see `geometry::seam_display`), so the saved arrangement
+    /// follows the displays and the pointer can always cross.
     fn resolve(&self, local: &[Monitor], remote: &[Monitor]) -> Result<Self> {
         ensure!(
             (-0.9..=0.9).contains(&self.edge_offset),
             "Invalid display alignment"
         );
-        fn select(monitors: &[Monitor], selected: Option<u32>) -> Result<u32> {
+        fn select(monitors: &[Monitor], selected: Option<u32>, side: Side) -> Result<u32> {
             let monitor = match selected {
                 Some(id) => monitors.iter().find(|m| m.id == id),
                 None => monitors
@@ -72,11 +76,11 @@ impl Layout {
                 monitor.width > 0 && monitor.height > 0,
                 "Invalid display size"
             );
-            Ok(monitor.id)
+            Ok(crate::geometry::seam_display(monitors, monitor, side).id)
         }
         Ok(Self {
-            local_monitor: Some(select(local, self.local_monitor)?),
-            remote_monitor: Some(select(remote, self.remote_monitor)?),
+            local_monitor: Some(select(local, self.local_monitor, self.side)?),
+            remote_monitor: Some(select(remote, self.remote_monitor, self.side.opposite())?),
             ..self.clone()
         })
     }
@@ -642,5 +646,60 @@ impl Service {
         if expired {
             self.disconnect("Layout synchronization timed out");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn display(id: u32, x: i32, width: u32, primary: bool) -> Monitor {
+        Monitor {
+            id,
+            identity: None,
+            name: String::new(),
+            x,
+            y: 0,
+            width,
+            height: 1080,
+            primary,
+        }
+    }
+
+    #[test]
+    fn the_settled_layout_meets_the_outside_of_both_desktops() {
+        let local = [display(1, 0, 1920, true), display(2, 1920, 1920, false)];
+        let remote = [display(7, 0, 1440, true), display(8, 1440, 1920, false)];
+        // On the left of the right-hand display, meeting the other
+        // computer's left-hand display: both edges are covered.
+        let layout = Layout {
+            side: Side::Left,
+            edge_offset: 0.1,
+            local_monitor: Some(2),
+            remote_monitor: Some(7),
+        };
+        let settled = layout.resolve(&local, &remote).unwrap();
+        assert_eq!(settled.local_monitor, Some(1));
+        assert_eq!(settled.remote_monitor, Some(8));
+        assert_eq!((settled.side, settled.edge_offset), (Side::Left, 0.1));
+        // Settling again changes nothing, and the other computer settles
+        // the mirrored layout to the same displays.
+        assert_eq!(settled.resolve(&local, &remote).unwrap(), settled);
+        assert_eq!(
+            layout.mirrored().resolve(&remote, &local).unwrap(),
+            settled.mirrored()
+        );
+        // The main display stands in when none is chosen, moved outward too.
+        let unchosen = Layout {
+            local_monitor: None,
+            remote_monitor: None,
+            side: Side::Right,
+            ..layout
+        };
+        let settled = unchosen.resolve(&local, &remote).unwrap();
+        assert_eq!(
+            (settled.local_monitor, settled.remote_monitor),
+            (Some(2), Some(7))
+        );
     }
 }

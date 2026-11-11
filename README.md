@@ -118,6 +118,11 @@ into a laptop, closing its lid or changing a resolution. While the display
 an edge belongs to is disconnected, that computer's main display takes its
 place, and the edge goes back to it once it's connected again.
 
+An edge always sits on the outside of each computer's desktop. If displays
+are rearranged so that another display covers the chosen one's edge, the
+edge moves to the display beyond it, where the pointer can cross, and the
+**Screens** page shows it there.
+
 ### Keyboard shortcuts
 
 With **Swap Command and Control** on (the default), Command shortcuts on a Mac

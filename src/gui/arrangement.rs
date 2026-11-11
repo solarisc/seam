@@ -1,8 +1,15 @@
 //! The screen arrangement: this computer's displays with every other
 //! computer placed against one edge. Drag a computer to move it.
+//!
+//! The picture follows the displays by itself. A computer always meets the
+//! outside of this computer's desktop and the outside of its own (see
+//! `geometry::seam_display`), and a computer's other displays never cover
+//! this computer's displays or another computer's: they move outward, past
+//! whatever they would cover.
 use super::theme;
 use crate::{
     config::{Arrangement, Side},
+    geometry::{seam_display, select_seam_display},
     protocol::Monitor,
 };
 use eframe::egui::{
@@ -34,37 +41,16 @@ pub struct Moved {
     pub local_monitor: Option<u32>,
 }
 
-/// `true` when another display of this computer covers the chosen edge, so
-/// the pointer can never cross there.
-pub fn edge_blocked(local: &[Monitor], arrangement: &Arrangement) -> bool {
-    select(local, arrangement.local_monitor)
-        .is_some_and(|anchor| blocked(local, anchor, arrangement.side))
+/// The display of this computer a computer arranged this way meets: the
+/// chosen one, or the one beyond it when another display covers its edge.
+pub fn seam_monitor<'a>(local: &'a [Monitor], arrangement: &Arrangement) -> Option<&'a Monitor> {
+    select_seam_display(local, arrangement.local_monitor, arrangement.side)
 }
 
-fn blocked(local: &[Monitor], anchor: &Monitor, side: Side) -> bool {
-    let edge = rect_of(anchor);
-    let strip = match side {
-        Side::Left => Rect::from_min_max(
-            Pos2::new(edge.left() - 2.0, edge.top()),
-            Pos2::new(edge.left(), edge.bottom()),
-        ),
-        Side::Right => Rect::from_min_max(
-            Pos2::new(edge.right(), edge.top()),
-            Pos2::new(edge.right() + 2.0, edge.bottom()),
-        ),
-        Side::Top => Rect::from_min_max(
-            Pos2::new(edge.left(), edge.top() - 2.0),
-            Pos2::new(edge.right(), edge.top()),
-        ),
-        Side::Bottom => Rect::from_min_max(
-            Pos2::new(edge.left(), edge.bottom()),
-            Pos2::new(edge.right(), edge.bottom() + 2.0),
-        ),
-    };
-    local.iter().any(|m| {
-        let overlap = rect_of(m).intersect(strip);
-        m.id != anchor.id && overlap.width() > 0.5 && overlap.height() > 0.5
-    })
+/// `true` when `monitor`'s edge on `side` is open: no other display of the
+/// same computer covers it, so a computer can meet it there.
+fn open_edge(monitors: &[Monitor], monitor: &Monitor, side: Side) -> bool {
+    seam_display(monitors, monitor, side).id == monitor.id
 }
 
 const PLACEHOLDER: (u32, u32) = (1920, 1080);
@@ -74,14 +60,6 @@ fn rect_of(monitor: &Monitor) -> Rect {
         Pos2::new(monitor.x as f32, monitor.y as f32),
         Vec2::new(monitor.width.max(1) as f32, monitor.height.max(1) as f32),
     )
-}
-
-fn select(monitors: &[Monitor], id: Option<u32>) -> Option<&Monitor> {
-    monitors
-        .iter()
-        .find(|m| Some(m.id) == id)
-        .or_else(|| monitors.iter().find(|m| m.primary))
-        .or_else(|| monitors.first())
 }
 
 fn placed(anchor: Rect, size: Vec2, side: Side, offset: f64, gap: f32) -> Rect {
@@ -105,6 +83,11 @@ fn placed(anchor: Rect, size: Vec2, side: Side, offset: f64, gap: f32) -> Rect {
         ),
     };
     Rect::from_min_size(origin, size)
+}
+
+/// The space between this computer's display and a computer beside it.
+fn gap_beside(anchor: Rect) -> f32 {
+    anchor.width().min(anchor.height()) * 0.06
 }
 
 /// The edge and alignment closest to where a dragged screen was dropped.
@@ -131,9 +114,47 @@ fn nearest(anchor: Rect, moved: Rect) -> (Side, f64) {
     }
 }
 
+/// Two screens cover each other, more than touching at an edge.
+fn overlaps(a: Rect, b: Rect) -> bool {
+    let shared = a.intersect(b);
+    shared.width() > 0.5 && shared.height() > 0.5
+}
+
+/// `rect` moved outward, toward `side`, until it covers none of
+/// `obstacles`, staying each one's gap away from those it had to pass.
+fn clear(mut rect: Rect, side: Side, obstacles: &[(Rect, f32)]) -> Rect {
+    // Each step passes every screen it covered, and only screens further out
+    // can be covered next, so one step per obstacle is enough.
+    for _ in 0..=obstacles.len() {
+        let push = obstacles
+            .iter()
+            .filter(|(obstacle, _)| overlaps(rect, *obstacle))
+            .map(|(obstacle, gap)| match side {
+                Side::Right => obstacle.right() + gap - rect.left(),
+                Side::Left => rect.right() - (obstacle.left() - gap),
+                Side::Bottom => obstacle.bottom() + gap - rect.top(),
+                Side::Top => rect.bottom() - (obstacle.top() - gap),
+            })
+            .fold(0.0_f32, f32::max);
+        if push <= 0.0 {
+            break;
+        }
+        rect = rect.translate(outward(side) * push);
+    }
+    rect
+}
+
+fn outward(side: Side) -> Vec2 {
+    match side {
+        Side::Left => Vec2::new(-1.0, 0.0),
+        Side::Right => Vec2::new(1.0, 0.0),
+        Side::Top => Vec2::new(0.0, -1.0),
+        Side::Bottom => Vec2::new(0.0, 1.0),
+    }
+}
+
 struct Group {
     key: Option<usize>,
-    blocked: bool,
     name: String,
     connected: bool,
     active: bool,
@@ -141,7 +162,80 @@ struct Group {
     offset: f64,
     anchor: Rect,
     selected: Rect,
-    monitors: Vec<(Rect, String)>,
+    /// Each display: where it is drawn, its name, and whether it is the one
+    /// that meets this computer.
+    monitors: Vec<(Rect, String, bool)>,
+}
+
+/// Places every computer in this computer's desktop coordinates: its seam
+/// display against the open edge of this computer's seam display, the rest
+/// of its displays where its own desktop puts them, moved outward when they
+/// would cover a display already placed. Computers are placed in order, so
+/// the first keeps its natural place.
+fn lay_out(local: &[Monitor], computers: &[Computer], fallback: &[Monitor]) -> Vec<Group> {
+    let mut occupied: Vec<Rect> = local.iter().map(rect_of).collect();
+    computers
+        .iter()
+        .map(|computer| {
+            let side = computer.arrangement.side;
+            let anchor = rect_of(seam_monitor(local, &computer.arrangement).unwrap());
+            let monitors = if computer.monitors.is_empty() {
+                fallback
+            } else {
+                &computer.monitors[..]
+            };
+            let seam = select_seam_display(
+                monitors,
+                computer.arrangement.remote_monitor,
+                side.opposite(),
+            )
+            .unwrap();
+            let gap = gap_beside(anchor);
+            let others: Vec<(Rect, f32)> = occupied.iter().map(|r| (*r, gap)).collect();
+            let target = clear(
+                placed(
+                    anchor,
+                    rect_of(seam).size(),
+                    side,
+                    computer.arrangement.edge_offset,
+                    gap,
+                ),
+                side,
+                &others,
+            );
+            let shift = target.min - rect_of(seam).min;
+            // Its other displays, nearest the seam display first, so each
+            // one that has to move lines up behind those closer in.
+            let mut rest: Vec<&Monitor> = monitors.iter().filter(|m| m.id != seam.id).collect();
+            rest.sort_by(|a, b| {
+                let distance =
+                    |m: &Monitor| (rect_of(m).center() - rect_of(seam).center()).length();
+                distance(a).total_cmp(&distance(b))
+            });
+            let mut own = vec![(target, seam.name.clone(), true)];
+            for monitor in rest {
+                let obstacles: Vec<(Rect, f32)> = others
+                    .iter()
+                    .copied()
+                    .chain(own.iter().map(|(r, _, _)| (*r, 0.0)))
+                    .collect();
+                let rect = clear(rect_of(monitor).translate(shift), side, &obstacles);
+                own.push((rect, monitor.name.clone(), false));
+            }
+            occupied.extend(own.iter().map(|(r, _, _)| *r));
+            Group {
+                key: computer.key,
+                name: computer.name.clone(),
+                connected: computer.connected,
+                active: computer.active,
+                side,
+                offset: computer.arrangement.edge_offset,
+                anchor,
+                selected: target,
+                monitors: own,
+            }
+        })
+        .collect()
 }
 
 /// Draws this computer's displays and the other computers around them, and
@@ -178,51 +272,14 @@ pub fn show(
         local
     };
 
-    // Lay out every computer in this computer's desktop coordinates.
-    let groups: Vec<Group> = computers
-        .iter()
-        .map(|computer| {
-            let anchor_monitor = select(local, computer.arrangement.local_monitor).unwrap();
-            let anchor = rect_of(anchor_monitor);
-            let monitors = if computer.monitors.is_empty() {
-                &fallback[..]
-            } else {
-                &computer.monitors[..]
-            };
-            let selected = select(monitors, computer.arrangement.remote_monitor).unwrap();
-            let gap = anchor.width().min(anchor.height()) * 0.06;
-            let target = placed(
-                anchor,
-                rect_of(selected).size(),
-                computer.arrangement.side,
-                computer.arrangement.edge_offset,
-                gap,
-            );
-            let shift = target.min - rect_of(selected).min;
-            Group {
-                key: computer.key,
-                blocked: blocked(local, anchor_monitor, computer.arrangement.side),
-                name: computer.name.clone(),
-                connected: computer.connected,
-                active: computer.active,
-                side: computer.arrangement.side,
-                offset: computer.arrangement.edge_offset,
-                anchor,
-                selected: target,
-                monitors: monitors
-                    .iter()
-                    .map(|m| (rect_of(m).translate(shift), m.name.clone()))
-                    .collect(),
-            }
-        })
-        .collect();
+    let groups = lay_out(local, computers, &fallback);
     let bounds = local
         .iter()
         .map(rect_of)
         .chain(
             groups
                 .iter()
-                .flat_map(|g| g.monitors.iter().map(|(r, _)| *r)),
+                .flat_map(|g| g.monitors.iter().map(|(r, _, _)| *r)),
         )
         .reduce(Rect::union)
         .unwrap();
@@ -243,7 +300,7 @@ pub fn show(
         let hit = group
             .monitors
             .iter()
-            .map(|(r, _)| project(*r))
+            .map(|(r, _, _)| project(*r))
             .reduce(Rect::union)
             .unwrap();
         let id = ui.id().with(("arrangement", group.key));
@@ -271,16 +328,15 @@ pub fn show(
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             }
             let dropped = project(group.selected).translate(drag.delta);
-            // Attach to the nearest outer edge of any of this computer's
-            // displays; an edge shared with another display cannot be crossed.
+            // Attach to the nearest open edge of any of this computer's
+            // displays; an edge another display covers cannot be crossed.
             let (anchor, side, offset) = local
                 .iter()
                 .filter_map(|monitor| {
                     let area = project(rect_of(monitor));
                     let (side, offset) = nearest(area, dropped);
-                    let gap = area.width().min(area.height()) * 0.06;
-                    let target = placed(area, dropped.size(), side, offset, gap);
-                    (!blocked(local, monitor, side)).then(|| {
+                    let target = placed(area, dropped.size(), side, offset, gap_beside(area));
+                    open_edge(local, monitor, side).then(|| {
                         let distance = (target.center() - dropped.center()).length();
                         (distance, monitor, side, offset)
                     })
@@ -289,7 +345,11 @@ pub fn show(
                 .map(|(_, monitor, side, offset)| (monitor, side, offset))
                 .unwrap_or_else(|| {
                     let (side, offset) = nearest(project(group.anchor), dropped);
-                    (select(local, None).unwrap(), side, offset)
+                    (
+                        select_seam_display(local, None, side).unwrap(),
+                        side,
+                        offset,
+                    )
                 });
             let free = !groups.iter().any(|g| g.key != group.key && g.side == side);
             preview = Some((project(rect_of(anchor)), group, side, offset, free));
@@ -371,18 +431,15 @@ pub fn show(
         } else {
             Vec2::ZERO
         };
-        let (fill, text_color, muted) = if group.blocked {
-            (p.danger_soft, p.text, p.muted)
-        } else if group.connected {
+        let (fill, text_color, muted) = if group.connected {
             (p.accent_soft, p.text, p.muted)
         } else {
             (p.screen, p.muted, p.faint)
         };
-        for (world, name) in &group.monitors {
+        for (world, name, selected) in &group.monitors {
             let rect = project(*world).translate(delta);
-            let selected = *world == group.selected;
             let inner = screen(rect, fill, None);
-            if selected {
+            if *selected {
                 label(inner, &group.name, name, text_color, muted);
                 highlights.push((
                     ui.id().with(("pointer", group.key)),
@@ -398,13 +455,7 @@ pub fn show(
                 project(group.selected),
                 group.side,
                 group.offset,
-                if group.blocked {
-                    p.danger
-                } else if group.connected {
-                    p.accent
-                } else {
-                    p.faint
-                },
+                if group.connected { p.accent } else { p.faint },
             );
         }
     }
@@ -441,7 +492,7 @@ pub fn show(
             project(group.selected).size(),
             side,
             offset,
-            anchor.width().min(anchor.height()) * 0.06,
+            gap_beside(anchor),
         );
         let color = if free { p.accent } else { p.danger };
         painter.rect(
@@ -529,31 +580,132 @@ fn text(
 mod tests {
     use super::*;
 
-    #[test]
-    fn an_edge_shared_with_another_display_is_blocked() {
-        let display = |id, x| Monitor {
+    fn display(id: u32, x: i32, y: i32, width: u32, height: u32) -> Monitor {
+        Monitor {
             id,
             identity: None,
-            name: String::new(),
+            name: format!("Display {id}"),
             x,
-            y: 0,
-            width: 1920,
-            height: 1080,
+            y,
+            width,
+            height,
             primary: id == 1,
-        };
-        let local = [display(1, 0), display(2, 1920)];
-        assert!(blocked(&local, &local[0], Side::Right));
-        assert!(!blocked(&local, &local[0], Side::Left));
-        assert!(blocked(&local, &local[1], Side::Left));
-        assert!(!blocked(&local, &local[1], Side::Right));
-        assert!(!blocked(&local, &local[1], Side::Top));
-        assert!(edge_blocked(
-            &local,
-            &Arrangement {
-                local_monitor: Some(1),
-                ..Arrangement::on(Side::Right)
+        }
+    }
+
+    fn computer(
+        key: usize,
+        side: Side,
+        local_monitor: Option<u32>,
+        monitors: Vec<Monitor>,
+    ) -> Computer {
+        Computer {
+            key: Some(key),
+            name: format!("Computer {key}"),
+            monitors,
+            arrangement: Arrangement {
+                local_monitor,
+                ..Arrangement::on(side)
+            },
+            connected: true,
+            active: false,
+        }
+    }
+
+    /// Every pair of screens in the picture, this computer's and the
+    /// others', apart from each other.
+    fn assert_apart(local: &[Monitor], groups: &[Group]) {
+        let screens: Vec<Rect> = local
+            .iter()
+            .map(rect_of)
+            .chain(groups.iter().flat_map(|g| g.monitors.iter().map(|m| m.0)))
+            .collect();
+        for (i, a) in screens.iter().enumerate() {
+            for b in &screens[i + 1..] {
+                assert!(!overlaps(*a, *b), "{a:?} covers {b:?}");
             }
-        ));
+        }
+    }
+
+    #[test]
+    fn an_edge_another_display_covers_is_not_open() {
+        let local = [
+            display(1, 0, 0, 1920, 1080),
+            display(2, 1920, 0, 1920, 1080),
+        ];
+        assert!(!open_edge(&local, &local[0], Side::Right));
+        assert!(open_edge(&local, &local[0], Side::Left));
+        assert!(!open_edge(&local, &local[1], Side::Left));
+        assert!(open_edge(&local, &local[1], Side::Right));
+        assert!(open_edge(&local, &local[1], Side::Top));
+    }
+
+    #[test]
+    fn a_computer_on_a_covered_edge_moves_to_the_outside_of_the_desktop() {
+        // Arranged on the left of the right-hand display, behind the left one.
+        let local = [
+            display(1, 0, 0, 1920, 1080),
+            display(2, 1920, 0, 1920, 1080),
+        ];
+        let left = computer(0, Side::Left, Some(2), vec![display(7, 0, 0, 1920, 1080)]);
+        assert_eq!(seam_monitor(&local, &left.arrangement).unwrap().id, 1);
+        let groups = lay_out(&local, &[left], &[]);
+        assert_eq!(groups[0].anchor, rect_of(&local[0]));
+        assert!(groups[0].selected.right() < 0.0);
+        assert_apart(&local, &groups);
+    }
+
+    #[test]
+    fn a_computers_other_displays_never_cover_this_computers() {
+        // A computer on the right whose chosen display is its right-hand
+        // one: it meets this computer with its left-hand display instead.
+        let local = [
+            display(1, 0, 0, 1920, 1080),
+            display(2, 1920, 0, 1920, 1080),
+        ];
+        let mut right = computer(
+            0,
+            Side::Right,
+            Some(1),
+            vec![display(1, 0, 0, 1440, 900), display(2, 1440, 0, 1920, 1080)],
+        );
+        right.arrangement.remote_monitor = Some(2);
+        let groups = lay_out(&local, &[right], &[]);
+        let seam = groups[0].monitors.iter().find(|m| m.2).unwrap();
+        assert_eq!(seam.1, "Display 1");
+        assert!(groups[0].selected.left() > 3840.0);
+        assert_apart(&local, &groups);
+    }
+
+    #[test]
+    fn displays_that_would_cover_others_move_outward() {
+        // This computer's displays are staggered, so the one above the
+        // lower display reaches over the higher one; and a computer on the
+        // left has a display below its seam display that reaches under
+        // this computer.
+        let local = [
+            display(1, 0, 0, 1920, 1080),
+            display(2, 1920, 600, 1920, 1080),
+        ];
+        let above = computer(0, Side::Top, Some(2), vec![display(5, 0, 0, 2560, 1440)]);
+        let mut above_arrangement = above.arrangement.clone();
+        above_arrangement.edge_offset = -0.9;
+        let above = Computer {
+            arrangement: above_arrangement,
+            ..above
+        };
+        let left = computer(
+            1,
+            Side::Left,
+            Some(1),
+            vec![
+                display(5, 0, 0, 1920, 1080),
+                display(6, 1000, 1080, 2560, 1440),
+            ],
+        );
+        let below = computer(2, Side::Bottom, Some(1), vec![display(9, 0, 0, 3840, 2160)]);
+        let groups = lay_out(&local, &[above, left, below], &[]);
+        assert_apart(&local, &groups);
     }
 
     #[test]
