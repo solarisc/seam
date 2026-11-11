@@ -10,6 +10,10 @@ pub(super) fn transaction() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(windows)]
+mod virtual_files;
+#[cfg(all(test, windows))]
+pub(super) use virtual_files::paste;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
@@ -45,22 +49,19 @@ impl NativeClipboard {
         }
     }
 
-    /// Received `files`. On Windows they are offered as a cut, so a paste
-    /// takes them away: never pass files the person copied themselves.
-    pub fn set_files(&self, files: &[String]) -> anyhow::Result<()> {
+    /// Files another computer offered, fetched when a paste asks for them.
+    pub fn set_promised_files(
+        &self,
+        placeholder: &std::sync::Arc<super::Placeholder>,
+    ) -> anyhow::Result<()> {
         #[cfg(windows)]
         {
-            let _clipboard = windows::open()?;
-            clipboard_win::raw::set_file_list_with(files, clipboard_win::options::DoClear)
-                .map_err(|e| anyhow::anyhow!("publishing files: {e}"))?;
-            windows::cut()
+            virtual_files::offer(placeholder)
         }
         #[cfg(not(windows))]
         {
-            use clipboard_rs::Clipboard;
-            self.context
-                .set_files(files.to_vec())
-                .map_err(|e| anyhow::anyhow!(e.to_string()))
+            let _ = placeholder;
+            anyhow::bail!("offered files can't be pasted on this system")
         }
     }
 
@@ -74,7 +75,8 @@ impl NativeClipboard {
     }
 
     /// `image`, also as the received file at `path` so it can be pasted into
-    /// a folder. On Windows the file is offered as a cut, like `set_files`.
+    /// a folder. On Windows the file is offered as a cut, so a paste moves it
+    /// out of Seam's cache: never pass a file the person copied themselves.
     pub fn set_image_file(
         &self,
         image: &clipboard_rs::RustImageData,
@@ -168,10 +170,10 @@ mod windows {
         raw::set_string_with(text, NoClear).map_err(|e| anyhow!("publishing text: {e}"))
     }
 
-    /// Received files wait in Seam's cache. Offered as a cut, pasting them
-    /// into a folder moves them there, which on the same drive is a rename,
-    /// instead of leaving a second copy behind. Apps such as chat apps
-    /// ignore this and read them as before.
+    /// A received image's file waits in Seam's cache. Offered as a cut,
+    /// pasting it into a folder moves it there, which on the same drive is a
+    /// rename, instead of leaving a second copy behind. Apps such as chat
+    /// apps ignore this and read it as before.
     pub fn cut() -> Result<()> {
         // DROPEFFECT_MOVE
         const MOVE: u32 = 2;
@@ -304,11 +306,11 @@ mod tests {
     }
 
     #[test]
-    fn pasting_received_copies_into_a_folder_takes_them_off_the_clipboard() {
+    fn pasting_received_images_into_a_folder_takes_their_files_off_the_clipboard() {
         const CHILD: &str = "SEAM_CLIPBOARD_PASTE_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let result = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "clipboard::native::tests::pasting_received_copies_into_a_folder_takes_them_off_the_clipboard", "--nocapture"])
+                .args(["--exact", "clipboard::native::tests::pasting_received_images_into_a_folder_takes_their_files_off_the_clipboard", "--nocapture"])
                 .env(CHILD, "1").output().unwrap();
             assert!(
                 result.status.success(),
@@ -322,7 +324,35 @@ mod tests {
         let Some(_station) = PrivateStation::new() else {
             return;
         };
-        crate::clipboard::tests::assert_pasted_copies_leave_the_clipboard();
+        crate::clipboard::tests::assert_pasted_images_leave_the_clipboard();
+    }
+
+    #[test]
+    fn offered_files_are_fetched_when_pasted() {
+        const CHILD: &str = "SEAM_CLIPBOARD_OFFER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "clipboard::native::tests::offered_files_are_fetched_when_pasted",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "isolated offer test failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            show_skip(&result);
+            return;
+        }
+        let Some(_station) = PrivateStation::new() else {
+            return;
+        };
+        crate::clipboard::tests::assert_offered_files_arrive_when_pasted();
     }
 
     #[test]

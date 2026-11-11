@@ -18,7 +18,8 @@ open source and works over your local network.
 - **Up to five computers.** One computer shares its keyboard and mouse with
   up to four others, one on each screen edge.
 - **Clipboard, images and files.** Copy on one computer, paste on another.
-  Large files stream in the background without slowing the pointer.
+  Files are sent when you paste them, and large ones stream without slowing
+  the pointer.
 - **Sound.** Hear a computer you control through the speakers or headphones
   of the one you're using: lossless stereo, a few hundredths of a second
   behind.
@@ -126,15 +127,22 @@ switch apps on either system.
 
 ### Clipboard and files
 
-Copied text, images, files and folders are available on the other computer
-right away. Paste them into any app, or paste files and images into a folder
-in Finder or File Explorer; nothing is saved anywhere else. Until you paste,
-they wait in a private cache that Seam clears on its own. On Windows, pasting
-into a folder moves them there, as after Cut, so no second copy stays behind.
-Each kind can be turned off under **Settings**. Links inside a copied folder
-are skipped, and copying something new stops a large copy still on its way.
-The computer receiving files needs as much free disk space as they take,
-plus 1 GB.
+Copied text and images are available on the other computer right away.
+Paste them into any app, or paste an image into a folder in Finder or File
+Explorer as a file. Copied files and folders are only listed on the other
+computer: nothing of them is sent until you paste them there, so copying
+files while you work on one computer moves nothing over the network. File
+Explorer shows its usual copy progress while they arrive, and a Mac finishes
+the paste once they have. On Windows, files from another computer paste into
+File Explorer and into apps that take files pasted from Remote Desktop.
+
+Pasted files and images wait in a private cache that Seam clears on its own;
+nothing is saved anywhere else. On Windows, pasting an image into a folder
+moves its file there, as after Cut, so no second copy stays behind. Each kind
+can be turned off under **Settings**. Links inside a copied folder are
+skipped, and copying something new stops a large copy still on its way. The
+computer receiving files needs as much free disk space as they take, plus
+1 GB.
 
 ### Sound
 
