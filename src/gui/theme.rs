@@ -22,7 +22,6 @@ pub struct Palette {
     pub success: Color32,
     pub warning: Color32,
     pub danger: Color32,
-    pub danger_soft: Color32,
     /// Display frames in the arrangement.
     pub bezel: Color32,
     /// This computer's screens in the arrangement.
@@ -44,7 +43,6 @@ const LIGHT: Palette = Palette {
     success: Color32::from_rgb(0x2E, 0x9A, 0x5C),
     warning: Color32::from_rgb(0xB0, 0x6E, 0x0C),
     danger: Color32::from_rgb(0xC9, 0x3C, 0x37),
-    danger_soft: Color32::from_rgb(0xF8, 0xE3, 0xE1),
     bezel: Color32::from_rgb(0x3A, 0x3A, 0x39),
     screen: Color32::from_rgb(0xF4, 0xF3, 0xF0),
 };
@@ -64,7 +62,6 @@ const DARK: Palette = Palette {
     success: Color32::from_rgb(0x4C, 0xC0, 0x7F),
     warning: Color32::from_rgb(0xE8, 0xA8, 0x45),
     danger: Color32::from_rgb(0xF0, 0x6B, 0x63),
-    danger_soft: Color32::from_rgb(0x40, 0x23, 0x22),
     bezel: Color32::from_rgb(0x0B, 0x0B, 0x0B),
     screen: Color32::from_rgb(0x34, 0x34, 0x33),
 };

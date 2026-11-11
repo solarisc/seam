@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **The Screens page and edges follow how displays are arranged.** A
+  computer placed against an edge that another display covers sat on top of
+  that display, drawn in red, and the pointer couldn't cross to it. A
+  computer whose displays reached back toward this one was drawn over this
+  computer's screens. Now an edge always meets the outside of both
+  computers' desktops: when another display covers the chosen one's edge,
+  the edge moves to the display beyond it, on both computers, and is saved
+  there. A computer's other displays are drawn beyond the one it meets, so
+  no screen on the page covers another. Display menus show the display each
+  edge actually uses, and a display whose edge is covered can't be chosen.
+
 ## 1.1.0
 
 Sound from the computers you control, and better handling of display
