@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
+
+Copied files are sent when you paste them, and the Screens page keeps every
+computer in place however your displays are arranged.
+
+### Install
+
+- **Windows 10 or 11:** download `Seam-1.2.0-windows-setup.exe` below and
+  run it; it updates an earlier version in place, keeping your settings and
+  pairings. The setup program isn't signed yet; if SmartScreen appears,
+  choose **More info → Run anyway**. `SHA256SUMS.txt` has its checksum.
+- **macOS 11 or later:** releases don't include the Mac app yet. Build it
+  from source with `scripts/build-macos.sh --install`; see
+  [Build from source](https://github.com/solarisc/seam#build-from-source).
+
+Update Seam on every computer: 1.2.0 doesn't connect to earlier versions.
 
 ### Changed
 
