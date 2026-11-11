@@ -15,6 +15,8 @@ pub mod logging;
 mod mac_capture;
 #[cfg(target_os = "macos")]
 mod mac_displays;
+#[cfg(target_os = "macos")]
+mod mac_main;
 pub mod network;
 pub mod pairing;
 mod ports;

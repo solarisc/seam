@@ -74,10 +74,20 @@ struct LinkContext {
     sound: Arc<sound::Link>,
 }
 
-pub fn run(mut config: Config) -> Result<()> {
+pub fn run(config: Config) -> Result<()> {
+    // Read on the calling thread: a Mac names its displays through AppKit,
+    // which expects the main thread.
+    let local_monitors = monitors().context("reading local displays")?;
+    // A Mac answers pastes of offered files on the main thread's run loop.
+    #[cfg(target_os = "macos")]
+    return crate::mac_main::beside_main_loop(move || run_with(config, local_monitors))?;
+    #[cfg(not(target_os = "macos"))]
+    run_with(config, local_monitors)
+}
+
+fn run_with(mut config: Config, local_monitors: Vec<crate::protocol::Monitor>) -> Result<()> {
     config.validate()?;
     let agent_lock = AgentLock::acquire()?;
-    let local_monitors = monitors().context("reading local displays")?;
     if local_monitors.is_empty() {
         bail!("no local displays detected");
     }

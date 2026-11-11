@@ -91,6 +91,30 @@ are merged. Keys, buttons and scrolls keep their order. When control returns
 or a connection drops, held keys and buttons are released on the computer
 that received them.
 
+## Clipboard
+
+Each input session has a clipboard connection (`clipboard.rs`). Text and
+images are sent as soon as they are copied. Copied files are only offered:
+the copying computer lists them, their paths and sizes, and sends the list
+(`FilesOffer`). The receiving computer puts the offer on its clipboard
+without the files' contents, and asks for them (`FilesWanted`) only when an
+app reads contents, as a paste does. The answer is an ordinary file batch
+with the offer's ID, made of exactly the files listed; a file changed since
+then stops the batch. Something newer copied on either side withdraws the
+offer. The computer that controls others passes offers on between them and
+fetches the files only when they are pasted further on (`clipboard/offer.rs`).
+
+On Windows the offer is a set of virtual files on the OLE clipboard, as
+Remote Desktop offers files (`clipboard/native/virtual_files.rs`): File
+Explorer reads the list of files whenever the clipboard changes, but asks
+for a file's contents only when it pastes, and does that on a thread of its
+own. A plain list of file paths can't be offered without its files: Explorer
+reads it on every clipboard change. On a Mac each copied item is a
+pasteboard item whose file URL is provided when an app reads it, and
+Universal Clipboard is kept from reading the offer at once. macOS asks for
+that on the main thread's run loop, so the agent runs on a thread of its own
+there (`mac_main.rs`).
+
 ## Sound
 
 While **Play its sound here** is on for a controlled computer, the

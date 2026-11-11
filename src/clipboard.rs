@@ -2,7 +2,7 @@ use crate::transfers::{self, Transfer};
 use crate::{
     config::Config,
     network::{SecureReader, SecureWriter},
-    protocol::{Data, FILE_CHUNK_SIZE},
+    protocol::{Data, FILE_CHUNK_SIZE, OfferedEntry},
 };
 use anyhow::{Context, Result, bail, ensure};
 #[cfg(not(target_os = "macos"))]
@@ -16,20 +16,22 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 use walkdir::WalkDir;
 
 mod files;
 mod image;
 mod native;
+mod offer;
 mod outgoing;
 mod pacing;
 mod received;
 mod relay;
 use image::PreparedImage;
 use native::NativeClipboard;
-use outgoing::Outgoing;
+use offer::Promise;
+use outgoing::{Offered, Outgoing};
 use pacing::BulkPacer;
 pub(crate) use pacing::InputSignals;
 
@@ -52,11 +54,26 @@ enum Job {
         /// Text copied with the image, such as a spreadsheet selection's cells.
         text: Option<String>,
     },
+    /// Files to offer. Nothing of them is sent until a paste asks.
     Files {
         paths: Vec<PathBuf>,
         /// A relayed copy's folder stays until it has been sent on.
         received: Option<Arc<received::Item>>,
     },
+    /// Files another computer offered, offered on to this link's peer.
+    Promised(Arc<Promise>),
+    /// Ask the peer for the files it offered as `id`: a paste wants them.
+    Want(u64),
+    /// Send offered files `id`, which a paste on the peer asked for, as
+    /// they were listed when offered.
+    Upload {
+        id: u64,
+        entries: Arc<Vec<Entry>>,
+        total: u64,
+        received: Option<Arc<received::Item>>,
+    },
+    /// Offered files `id` can't be sent anymore.
+    Withdrawn(u64),
 }
 
 struct Applied {
@@ -239,7 +256,7 @@ pub(crate) fn run_session(
         (watcher, stop)
     };
     // Complete fallible setup before starting either worker.
-    let mut incoming = Incoming::new(applied, config)?;
+    let mut incoming = Incoming::new(applied, config, outgoing.clone())?;
     incoming.context = context.clone();
     let replies = outgoing.clone();
     let sending_context = context.clone();
@@ -288,6 +305,7 @@ pub(crate) fn run_session(
                 replies.refused(id);
                 transfers::refused(context.session, id, &reason);
             }
+            Data::FilesWanted { id } => replies.wanted(id),
             message => match incoming.apply(message) {
                 Ok(Some(reply)) => replies.reply(reply),
                 Ok(None) => {}
@@ -302,6 +320,7 @@ pub(crate) fn run_session(
         }
     };
     cancel.stop();
+    incoming.disconnected();
     transfers::disconnect(context.session);
     let watched = watcher_thread.join();
     let written = writer_thread.join();
@@ -325,9 +344,18 @@ fn send_jobs(
         if cancel.is_stopped() {
             break;
         }
+        // Anything newer copied here replaces the files offered before.
+        if matches!(
+            job,
+            Job::Text(_) | Job::Image { .. } | Job::Files { .. } | Job::Promised(_)
+        ) {
+            outgoing.offer(None);
+        }
         match job {
             Job::Receipt(id) => writer.write(&Data::TransferReceipt { id })?,
             Job::Refusal { id, reason } => writer.write(&Data::TransferFailed { id, reason })?,
+            Job::Want(id) => writer.write(&Data::FilesWanted { id })?,
+            Job::Withdrawn(id) => writer.write(&Data::BatchAbort { id })?,
             Job::Text(value) if value.len() < 60_000 => writer.write(&Data::Text(value))?,
             Job::Text(value) => send_blob(
                 writer,
@@ -339,10 +367,71 @@ fn send_jobs(
             Job::Image { png, text } => {
                 send_blob(writer, BlobKind::Image { text }, png, &mut pacer, &context)?
             }
-            Job::Files {
-                paths,
+            // Listed now, so the other computer knows their names and
+            // sizes, but not read until a paste there asks for them.
+            Job::Files { paths, received } => match list_files(paths, cancel) {
+                Ok((entries, total)) => {
+                    let listing = entries
+                        .iter()
+                        .map(|(_, path, bytes)| OfferedEntry {
+                            path: path.clone(),
+                            bytes: *bytes,
+                        })
+                        .collect();
+                    let offered = Offered::Files {
+                        entries: Arc::new(entries),
+                        total,
+                        received,
+                    };
+                    offer_files(writer, &outgoing, listing, offered)?;
+                }
+                Err(error) => log::info!("not offering copied files: {error:#}"),
+            },
+            Job::Promised(promise) => {
+                let listing = promise.entries().to_vec();
+                offer_files(writer, &outgoing, listing, Offered::Promised(promise))?;
+            }
+            Job::Upload {
+                id,
+                entries,
+                total,
                 received: _received,
-            } => send_files(writer, paths, &outgoing, cancel, &mut pacer, &context)?,
+            } => send_files(
+                writer, id, &entries, total, &outgoing, cancel, &mut pacer, &context,
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// Room for paths in one offer message, well inside `MAX_WIRE_SIZE`.
+const OFFER_MESSAGE_BYTES: usize = 48 * 1024;
+
+/// Tells the peer about copied files, which a paste there can ask for.
+fn offer_files(
+    writer: &mut SecureWriter,
+    outgoing: &Outgoing,
+    listing: Vec<OfferedEntry>,
+    offered: Offered,
+) -> Result<()> {
+    let id = new_id();
+    // Known before the peer can ask for them.
+    outgoing.offer(Some((id, offered)));
+    let mut entries = Vec::new();
+    let mut size = 0;
+    let count = listing.len();
+    for (index, entry) in listing.into_iter().enumerate() {
+        // A path, its length and its size.
+        size += entry.path.len() + 24;
+        entries.push(entry);
+        let last = index + 1 == count;
+        if size >= OFFER_MESSAGE_BYTES || last {
+            writer.write(&Data::FilesOffer {
+                id,
+                entries: std::mem::take(&mut entries),
+                last,
+            })?;
+            size = 0;
         }
     }
     Ok(())
@@ -435,24 +524,19 @@ fn send_blob(
     Ok(())
 }
 
+/// Sends offered files `id`, as they were listed when offered.
+#[allow(clippy::too_many_arguments)]
 fn send_files(
     writer: &mut SecureWriter,
-    roots: Vec<PathBuf>,
+    id: u64,
+    entries: &[Entry],
+    total: u64,
     outgoing: &Outgoing,
     cancel: &crate::shutdown::Signal,
     pacer: &mut BulkPacer,
     context: &transfers::Context,
 ) -> Result<()> {
-    let id = new_id();
     let mut progress = Transfer::start(context, id, true, "Preparing files…".into(), 0);
-    let (entries, total) = match list_files(roots, cancel) {
-        Ok(listed) => listed,
-        Err(error) => {
-            log::warn!("cannot send copied files: {error:#}");
-            progress.fail(&format!("{error:#}"));
-            return Ok(());
-        }
-    };
     progress.total(total);
     writer.write(&Data::BatchStart {
         id,
@@ -489,11 +573,15 @@ enum Stopped {
     Local(anyhow::Error),
 }
 
-/// A file to send, or a folder when it has no size.
-type Entry = (PathBuf, String, Option<u64>);
+/// A file to send, or a folder when it has no size: where it is here, and
+/// its path within the copy.
+pub(super) type Entry = (PathBuf, String, Option<u64>);
 
 /// Everything under `roots`, checked before any of it is announced.
-fn list_files(roots: Vec<PathBuf>, cancel: &crate::shutdown::Signal) -> Result<(Vec<Entry>, u64)> {
+pub(super) fn list_files(
+    roots: Vec<PathBuf>,
+    cancel: &crate::shutdown::Signal,
+) -> Result<(Vec<Entry>, u64)> {
     let mut entries = Vec::new();
     let mut total = 0u64;
     let mut top_names = HashSet::new();
@@ -561,7 +649,7 @@ fn list_files(roots: Vec<PathBuf>, cancel: &crate::shutdown::Signal) -> Result<(
 /// Sends every entry of batch `id`, unless something stops it first.
 fn send_entries(
     writer: &mut SecureWriter,
-    entries: Vec<Entry>,
+    entries: &[Entry],
     outgoing: &Outgoing,
     cancel: &crate::shutdown::Signal,
     pacer: &mut BulkPacer,
@@ -578,11 +666,11 @@ fn send_entries(
         if let Some(stop) = outgoing.stop(id) {
             return Ok(Some(Stopped::Peer(stop)));
         }
-        progress.name(&wire_path);
-        let Some(size) = size else {
+        progress.name(wire_path);
+        let Some(size) = *size else {
             writer.write(&Data::Directory {
                 id,
-                path: wire_path,
+                path: wire_path.clone(),
             })?;
             continue;
         };
@@ -592,13 +680,13 @@ fn send_entries(
         };
         let changed =
             || Stopped::Local(anyhow::anyhow!("“{name}” changed while it was being sent"));
-        let mut file = match File::open(&path) {
+        let mut file = match File::open(path) {
             Ok(file) => file,
             Err(error) => return Ok(Some(unreadable(error))),
         };
         writer.write(&Data::FileStart {
             id,
-            path: wire_path,
+            path: wire_path.clone(),
             bytes: size,
         })?;
         let mut sent = 0u64;
@@ -740,6 +828,13 @@ struct Incoming {
     image: Option<Blob>,
     /// The clipboard's generation when the transfer in progress began.
     started: u64,
+    /// The files the peer offered last, while they can still be pasted:
+    /// the clipboard, a paste in progress or another computer holds them.
+    promise: Weak<Promise>,
+    /// An offer whose listing is still arriving.
+    offering: Option<(u64, Vec<OfferedEntry>)>,
+    /// The connection back to the peer, to ask for offered files.
+    peer: Arc<Outgoing>,
 }
 
 fn refusal(id: u64, reason: &str) -> Job {
@@ -750,7 +845,11 @@ fn refusal(id: u64, reason: &str) -> Job {
 }
 
 impl Incoming {
-    fn new(applied: Arc<Mutex<Option<Applied>>>, config: Config) -> Result<Self> {
+    fn new(
+        applied: Arc<Mutex<Option<Applied>>>,
+        config: Config,
+        peer: Arc<Outgoing>,
+    ) -> Result<Self> {
         // Clears copies an earlier run left in the cache.
         let _ = received::directory();
         Ok(Self {
@@ -763,7 +862,17 @@ impl Incoming {
             text: None,
             image: None,
             started: 0,
+            promise: Weak::new(),
+            offering: None,
+            peer,
         })
+    }
+
+    /// The connection ended: offered files can't be fetched anymore.
+    fn disconnected(&mut self) {
+        if let Some(promise) = self.promise.upgrade() {
+            promise.fail("The other computer disconnected");
+        }
     }
 
     /// Applies one message from the peer and says what to send back. An
@@ -854,9 +963,32 @@ impl Incoming {
                     )));
                 }
             }
+            Data::FilesOffer { id, entries, last } => {
+                if self.config.files {
+                    let mut listing = match self.offering.take() {
+                        Some((offering, listing)) if offering == id => listing,
+                        _ => Vec::new(),
+                    };
+                    listing.extend(entries);
+                    ensure!(listing.len() <= MAX_TRANSFER_FILES, "invalid file offer");
+                    if !last {
+                        self.offering = Some((id, listing));
+                    } else if let Err(error) = check_listing(&listing) {
+                        // Such as a name this system doesn't allow.
+                        log::warn!("cannot offer files from {}: {error:#}", self.context.peer);
+                        if let Some(previous) = self.promise.upgrade() {
+                            previous.fail("Something newer was copied");
+                        }
+                    } else {
+                        self.offered(id, listing);
+                    }
+                }
+            }
             // Answers about this computer's own transfers, which the session
             // loop handles.
-            Data::TransferReceipt { .. } | Data::TransferFailed { .. } => {}
+            Data::TransferReceipt { .. }
+            | Data::TransferFailed { .. }
+            | Data::FilesWanted { .. } => {}
         }
         Ok(None)
     }
@@ -902,7 +1034,40 @@ impl Incoming {
         }
     }
 
+    /// The peer copied files. They go on the clipboard as a promise that a
+    /// paste fetches, and on to this computer's other destinations.
+    fn offered(&mut self, id: u64, listing: Vec<OfferedEntry>) {
+        let promise = Promise::new(id, listing, &self.peer);
+        let previous = std::mem::replace(&mut self.promise, Arc::downgrade(&promise));
+        if let Some(previous) = previous.upgrade() {
+            previous.fail("Something newer was copied");
+        }
+        let placeholder = Arc::new(Placeholder {
+            promise: promise.clone(),
+            digest: *blake3::hash(&id.to_le_bytes()).as_bytes(),
+        });
+        match self.apply_native(placeholder.digest, None, |clipboard| {
+            clipboard.set_promised_files(&placeholder)
+        }) {
+            Ok(()) => relay::publish(self.context.session, Job::Promised(promise)),
+            Err(error) => log::warn!(
+                "cannot offer files from {} on the clipboard: {error:#}",
+                self.context.peer
+            ),
+        }
+    }
+
+    /// The offered files a batch brings, when a paste asked for them.
+    fn promised(&self, id: u64) -> Option<Arc<Promise>> {
+        self.promise.upgrade().filter(|promise| promise.id() == id)
+    }
+
     fn receive_files(&mut self, message: Data) -> Result<Option<Job>> {
+        if let Data::BatchAbort { id } = message
+            && let Some(promise) = self.promised(id)
+        {
+            promise.fail("Stopped by the sending computer");
+        }
         match &message {
             Data::BatchStart { id, bytes, .. } => self.begin(*id, "Files", *bytes),
             Data::FileStart { path, .. } => {
@@ -933,60 +1098,46 @@ impl Incoming {
                 }
                 None
             }
-            files::Received::Failed { id, error } => Some(self.finish(id, Err(error))),
+            files::Received::Failed { id, error } => {
+                if let Some(promise) = self.promised(id) {
+                    promise.fail(&format!("{error:#}"));
+                }
+                Some(self.finish(id, Err(error)))
+            }
             files::Received::Complete { id, paths } => {
-                let offered = self.offer_files(paths);
-                Some(self.finish(id, offered))
+                let delivered = Self::deliver(self.promised(id), paths);
+                Some(self.finish(id, delivered))
             }
         })
     }
 
-    fn offer_files(&self, paths: Vec<PathBuf>) -> Result<bool> {
-        // A completed batch's top-level entries share its own folder.
+    /// Hands files a paste asked for to the promise it waits on: `Ok(false)`
+    /// when nothing can paste them anymore, as after something newer was
+    /// copied.
+    fn deliver(promise: Option<Arc<Promise>>, paths: Vec<PathBuf>) -> Result<bool> {
         let item = received::Item::new(
             paths[0]
                 .parent()
                 .context("received files have no folder")?
                 .to_path_buf(),
         );
-        if self.replaced() {
-            received::retire(item);
-            return Ok(false);
+        match promise {
+            Some(promise) => {
+                promise.arrived(paths, item);
+                Ok(true)
+            }
+            // Dropping the copy deletes it.
+            None => Ok(false),
         }
-        let digest = digest_paths(&paths);
-        let relay = Job::Files {
-            paths: paths.clone(),
-            received: Some(item.clone()),
-        };
-        let files: Vec<String> = paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        self.apply_native(digest, Some(item.clone()), |clipboard| {
-            clipboard.set_files(&files)
-        })?;
-        #[cfg(windows)]
-        self.when_moved(&item, paths, false);
-        relay::publish(self.context.session, relay);
-        Ok(true)
     }
 
-    /// Received files are offered as a cut, so pasting them into a folder
-    /// moves them there. Once all have gone there is nothing left to paste:
-    /// take them off the clipboard, as Windows does after a cut and paste,
-    /// and delete their emptied folder.
+    /// A received image is also offered as a file, as a cut, so pasting it
+    /// into a folder moves it there. Once it has gone there is no file left
+    /// to paste: take it off the clipboard, as Windows does after a cut and
+    /// paste, keeping the picture, and delete its emptied folder.
     #[cfg(windows)]
     fn when_moved(&self, item: &Arc<received::Item>, paths: Vec<PathBuf>, image: bool) {
-        let applied = self.applied.clone();
-        let folder = item.path().to_path_buf();
-        let watched = item.watch(paths, move || {
-            if let Err(error) = take_back(&applied, &folder, image) {
-                log::warn!("taking pasted files off the clipboard: {error:#}");
-            }
-        });
-        if let Err(error) = watched {
-            log::warn!("cannot watch received files: {error:#}");
-        }
+        when_moved(&self.applied, item, paths, image);
     }
 
     fn offer_image(&self, id: u64, png: Vec<u8>, text: Option<String>) -> Result<bool> {
@@ -1052,6 +1203,102 @@ impl Incoming {
         }
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn when_moved(
+    applied: &Arc<Mutex<Option<Applied>>>,
+    item: &Arc<received::Item>,
+    paths: Vec<PathBuf>,
+    image: bool,
+) {
+    let applied = applied.clone();
+    let folder = item.path().to_path_buf();
+    let watched = item.watch(paths, move || {
+        if let Err(error) = take_back(&applied, &folder, image) {
+            log::warn!("taking pasted files off the clipboard: {error:#}");
+        }
+    });
+    if let Err(error) = watched {
+        log::warn!("cannot watch received files: {error:#}");
+    }
+}
+
+/// Files another computer offered, on this computer's clipboard until a
+/// paste asks for them.
+pub(super) struct Placeholder {
+    promise: Arc<Promise>,
+    /// Marks the clipboard content that is this placeholder.
+    digest: [u8; 32],
+}
+
+impl Placeholder {
+    /// How many items were copied.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn count(&self) -> usize {
+        self.promise.count()
+    }
+
+    /// Every offered file and folder, each folder before what it holds.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn entries(&self) -> &[OfferedEntry] {
+        self.promise.entries()
+    }
+
+    /// Waits for the files a paste asked for: their paths, or `None` when
+    /// they can't come.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn files(&self) -> Option<Vec<String>> {
+        match self.promise.fetch() {
+            Ok((paths, _)) => Some(paths_to_strings(&paths)),
+            Err(error) => {
+                log::warn!("cannot paste offered files: {error:#}");
+                None
+            }
+        }
+    }
+
+    /// Asks for the files a paste wants without waiting for them: the folder
+    /// holding them once they have arrived, `None` while they are on their way.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn try_folder(&self) -> Option<Result<PathBuf>> {
+        self.promise
+            .try_fetch()
+            .map(|fetched| fetched.map(|(_, item)| item.path().to_path_buf()))
+    }
+}
+
+fn paths_to_strings(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// An offer's listing must describe files this computer could receive,
+/// each folder before what it holds. Anything else is a broken peer.
+fn check_listing(listing: &[OfferedEntry]) -> Result<()> {
+    ensure!(!listing.is_empty(), "empty file offer");
+    let mut seen = HashSet::new();
+    let mut folders = HashSet::new();
+    let mut total = 0u64;
+    for entry in listing {
+        safe_relative(&entry.path)?;
+        ensure!(seen.insert(entry.path.as_str()), "duplicate offered path");
+        if let Some((folder, _)) = entry.path.rsplit_once('/') {
+            ensure!(folders.contains(folder), "offered path outside its folder");
+        }
+        match entry.bytes {
+            None => {
+                folders.insert(entry.path.as_str());
+            }
+            Some(bytes) => {
+                total = total.checked_add(bytes).context("offer size overflow")?;
+                ensure!(total <= MAX_TRANSFER_BYTES, "offered files too large");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Clipboard managers and other apps hold the clipboard open for a moment
@@ -1203,7 +1450,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    pub(super) fn assert_pasted_copies_leave_the_clipboard() {
+    pub(super) fn assert_pasted_images_leave_the_clipboard() {
         use clipboard_rs::common::RustImage;
         use std::fs;
         let (mut handler, incoming) = native_handlers(
@@ -1213,24 +1460,6 @@ mod tests {
         handler.config.files = true;
         handler.config.images = true;
         let folder = tempfile::tempdir().unwrap();
-
-        // Files: pasting them into a folder leaves nothing to paste.
-        let copy = folder.path().join("files");
-        fs::create_dir(&copy).unwrap();
-        let file = copy.join("a.txt");
-        fs::write(&file, b"received").unwrap();
-        assert!(incoming.offer_files(vec![file.clone()]).unwrap());
-        assert_eq!(
-            handler.ctx.get_files().unwrap(),
-            vec![file.to_string_lossy().into_owned()]
-        );
-        assert_eq!(drop_effect(), Some(CUT.to_vec()));
-        // As File Explorer pastes a cut on the same drive.
-        let pasted = folder.path().join("a.txt");
-        fs::rename(&file, &pasted).unwrap();
-        wait_until_deleted(&copy);
-        assert!(handler.ctx.get_files().unwrap_or_default().is_empty());
-        assert_eq!(fs::read(&pasted).unwrap(), b"received");
 
         // A picture: pasting its file into a folder keeps the picture.
         let copy = folder.path().join("image");
@@ -1353,11 +1582,15 @@ mod tests {
         writer.set_timeout(Duration::from_secs(5)).unwrap();
         let sender = thread::spawn(move || {
             let mut pacer = BulkPacer::new(test_signals());
+            let cancel = crate::shutdown::Signal::default();
+            let (entries, total) = list_files(vec![source], &cancel)?;
             send_files(
                 &mut writer,
-                vec![source],
+                new_id(),
+                &entries,
+                total,
                 &Outgoing::new(),
-                &crate::shutdown::Signal::default(),
+                &cancel,
                 &mut pacer,
                 &transfers::Context::default(),
             )
@@ -1380,20 +1613,26 @@ mod tests {
     }
 
     /// Sends `roots` as files with `outgoing` and returns what arrived,
-    /// up to and including a text message sent after them.
-    fn sent_files(roots: Vec<PathBuf>, outgoing: Outgoing) -> Vec<Data> {
+    /// up to and including a text message sent after them. `meanwhile` runs
+    /// between listing the files and sending them.
+    fn sent_files(roots: Vec<PathBuf>, outgoing: Outgoing, meanwhile: impl FnOnce()) -> Vec<Data> {
         use std::{thread, time::Duration};
 
         let (mut reader, mut writer) = encrypted_pipe();
         reader.set_timeout(Duration::from_secs(5)).unwrap();
         writer.set_timeout(Duration::from_secs(5)).unwrap();
+        let cancel = crate::shutdown::Signal::default();
+        let (entries, total) = list_files(roots, &cancel).unwrap();
+        meanwhile();
         let sender = thread::spawn(move || {
             let mut pacer = BulkPacer::new(test_signals());
             send_files(
                 &mut writer,
-                roots,
+                new_id(),
+                &entries,
+                total,
                 &outgoing,
-                &crate::shutdown::Signal::default(),
+                &cancel,
                 &mut pacer,
                 &transfers::Context::default(),
             )?;
@@ -1414,13 +1653,104 @@ mod tests {
     }
 
     #[test]
-    fn a_copy_that_cannot_be_sent_fails_alone() {
+    fn files_gone_since_they_were_offered_are_called_off_alone() {
         let folder = tempfile::tempdir().unwrap();
-        let arrived = sent_files(vec![folder.path().join("deleted")], Outgoing::new());
+        let file = folder.path().join("deleted.txt");
+        std::fs::write(&file, b"offered").unwrap();
+        let arrived = sent_files(vec![file.clone()], Outgoing::new(), || {
+            std::fs::remove_file(&file).unwrap()
+        });
         assert!(
-            matches!(arrived[..], [Data::Text(_)]),
-            "nothing is announced for a copy that can't be read: {arrived:?}"
+            matches!(
+                arrived[..],
+                [
+                    Data::BatchStart { .. },
+                    Data::BatchAbort { .. },
+                    Data::Text(_)
+                ]
+            ),
+            "{arrived:?}"
         );
+        assert!(
+            list_files(vec![file], &crate::shutdown::Signal::default()).is_err(),
+            "missing files aren't offered"
+        );
+    }
+
+    #[test]
+    fn copied_files_are_listed_and_sent_only_when_asked_for() {
+        use std::{fs, thread, time::Duration};
+
+        let folder = tempfile::tempdir().unwrap();
+        let source = folder.path().join("copied");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("a.txt"), b"first").unwrap();
+        let (mut reader, mut writer) = encrypted_pipe();
+        reader.set_timeout(Duration::from_secs(5)).unwrap();
+        writer.set_timeout(Duration::from_secs(5)).unwrap();
+        let outgoing = Arc::new(Outgoing::new());
+        let cancel = Arc::new(crate::shutdown::Signal::default());
+        let sender = {
+            let (outgoing, cancel) = (outgoing.clone(), cancel.clone());
+            thread::spawn(move || {
+                send_jobs(
+                    &mut writer,
+                    outgoing,
+                    &cancel,
+                    test_signals(),
+                    transfers::Context::default(),
+                )
+            })
+        };
+        outgoing.submit(Job::Files {
+            paths: vec![source],
+            received: None,
+        });
+        let Data::FilesOffer { id, entries, last } = reader.read::<Data>().unwrap() else {
+            panic!("a copy is offered")
+        };
+        assert!(last);
+        assert_eq!(
+            entries,
+            vec![
+                OfferedEntry {
+                    path: "copied".into(),
+                    bytes: None
+                },
+                OfferedEntry {
+                    path: "copied/a.txt".into(),
+                    bytes: Some(5)
+                },
+            ]
+        );
+        reader.set_timeout(Duration::from_millis(300)).unwrap();
+        assert!(reader.read::<Data>().is_err(), "nothing more until asked");
+        reader.set_timeout(Duration::from_secs(5)).unwrap();
+
+        outgoing.wanted(id);
+        let mut receiver = files::Receiver::new(folder.path().join("received"));
+        let paths = loop {
+            match receiver.apply(reader.read::<Data>().unwrap()).unwrap() {
+                files::Received::Complete { id: sent, paths } => {
+                    assert_eq!(sent, id, "the batch answers the offer");
+                    break paths;
+                }
+                files::Received::Pending => {}
+                _ => panic!("the files arrive"),
+            }
+        };
+        assert_eq!(fs::read(paths[0].join("a.txt")).unwrap(), b"first");
+        // Something newer copied here withdraws the offer.
+        outgoing.submit(Job::Text("newer".into()));
+        assert!(matches!(reader.read::<Data>().unwrap(), Data::Text(_)));
+        outgoing.wanted(id);
+        assert!(matches!(
+            reader.read::<Data>().unwrap(),
+            Data::BatchAbort { id: called_off } if called_off == id
+        ));
+        cancel.stop();
+        outgoing.close();
+        sender.join().unwrap().unwrap();
     }
 
     #[test]
@@ -1431,7 +1761,7 @@ mod tests {
         std::fs::write(source.join("a.bin"), vec![1; FILE_CHUNK_SIZE * 3]).unwrap();
         let outgoing = Outgoing::new();
         outgoing.submit(Job::Text("newer".into()));
-        let arrived = sent_files(vec![source], outgoing);
+        let arrived = sent_files(vec![source], outgoing, || {});
         assert!(
             matches!(
                 arrived[..],
@@ -1470,8 +1800,159 @@ mod tests {
             text: None,
             image: None,
             started: 0,
+            promise: Weak::new(),
+            offering: None,
+            peer: outgoing.clone(),
         };
         (handler, incoming)
+    }
+
+    /// Offered files reach the clipboard as a list without their contents.
+    /// Only a paste reads contents, and that fetches the files and waits.
+    #[cfg(windows)]
+    pub(super) fn assert_offered_files_arrive_when_pasted() {
+        use native::paste::Clipboard;
+        use std::{sync::mpsc, time::Duration};
+        let (mut handler, mut incoming) = native_handlers(
+            NativeClipboard::new().unwrap(),
+            NativeClipboard::new().unwrap(),
+        );
+        handler.config.files = true;
+        incoming.config.files = true;
+        let cache = tempfile::tempdir().unwrap();
+        incoming.files = Some(files::Receiver::new(cache.path().to_path_buf()));
+        // A pasting app, on a thread of its own as File Explorer's.
+        let (paste, pasting) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        std::thread::spawn(move || {
+            unsafe { windows::Win32::System::Ole::OleInitialize(None) }.unwrap();
+            for task in pasting {
+                task();
+            }
+        });
+        let pasted = |task: fn(&Clipboard) -> Box<dyn std::any::Any + Send>| {
+            let (done, result) = mpsc::channel();
+            paste
+                .send(Box::new(move || {
+                    let _ = done.send(task(&Clipboard::open()));
+                }))
+                .unwrap();
+            result
+        };
+
+        let listing = vec![
+            OfferedEntry {
+                path: "folder".into(),
+                bytes: None,
+            },
+            OfferedEntry {
+                path: "folder/offered.txt".into(),
+                bytes: Some(5),
+            },
+        ];
+        assert!(
+            incoming
+                .apply(Data::FilesOffer {
+                    id: 9,
+                    entries: listing,
+                    last: true,
+                })
+                .unwrap()
+                .is_none()
+        );
+        // The offer on the clipboard is not a copy made here.
+        handler.capture().unwrap();
+        // File Explorer reads the list whenever the clipboard changes.
+        let listed = pasted(|clipboard| Box::new(clipboard.listed()))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .downcast::<Option<Vec<String>>>()
+            .unwrap();
+        assert_eq!(
+            *listed,
+            Some(vec![
+                "folder".to_string(),
+                r"folder\offered.txt".to_string()
+            ])
+        );
+        let peer = handler.outgoing.clone();
+        let (asked, wanted) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = asked.send(peer.recv());
+        });
+        assert!(
+            wanted.recv_timeout(Duration::from_millis(300)).is_err(),
+            "nothing is fetched before a paste reads contents"
+        );
+
+        let contents = pasted(|clipboard| Box::new(clipboard.contents(1).map_err(|e| e.code())));
+        assert!(matches!(
+            wanted.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Job::Want(9))
+        ));
+        assert!(
+            contents.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the paste waits for the files"
+        );
+        for message in [
+            Data::BatchStart {
+                id: 9,
+                count: 2,
+                bytes: 5,
+            },
+            Data::Directory {
+                id: 9,
+                path: "folder".into(),
+            },
+            Data::FileStart {
+                id: 9,
+                path: "folder/offered.txt".into(),
+                bytes: 5,
+            },
+            Data::FileChunk {
+                id: 9,
+                bytes: b"hello".to_vec(),
+            },
+            Data::FileEnd { id: 9 },
+        ] {
+            assert!(incoming.apply(message).unwrap().is_none());
+        }
+        assert!(matches!(
+            incoming.apply(Data::BatchEnd { id: 9 }).unwrap(),
+            Some(Job::Receipt(9))
+        ));
+        let contents = contents
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .downcast::<std::result::Result<Vec<u8>, windows_core::HRESULT>>()
+            .unwrap();
+        assert_eq!(*contents, Ok(b"hello".to_vec()));
+
+        // Nothing about the paste is a copy made here either.
+        handler.outgoing = Arc::new(Outgoing::new());
+        handler.capture().unwrap();
+        assert_no_echo(handler.outgoing.clone());
+
+        // Newer files replace these, and a paste of ones the sender called
+        // off fails instead of waiting.
+        let newer = vec![OfferedEntry {
+            path: "newer.txt".into(),
+            bytes: Some(1),
+        }];
+        incoming
+            .apply(Data::FilesOffer {
+                id: 10,
+                entries: newer,
+                last: true,
+            })
+            .unwrap();
+        incoming.apply(Data::BatchAbort { id: 10 }).unwrap();
+        let failed = pasted(|clipboard| Box::new(clipboard.contents(0).is_err()))
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .downcast::<bool>()
+            .unwrap();
+        assert!(*failed);
+        incoming.disconnected();
     }
 
     fn assert_no_echo(outgoing: Arc<Outgoing>) {

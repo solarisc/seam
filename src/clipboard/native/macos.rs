@@ -1,16 +1,18 @@
-use anyhow::{Result, bail, ensure};
+use crate::clipboard::Placeholder;
+use anyhow::{Result, ensure};
 use clipboard_rs::{ContentFormat, RustImageData, common::RustImage};
 use objc2::{
-    AllocAnyThread, ClassType,
+    AllocAnyThread, ClassType, DefinedClass, define_class, msg_send,
     rc::{Retained, autoreleasepool},
-    runtime::ProtocolObject,
+    runtime::{NSObject, NSObjectProtocol, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSImage, NSPasteboard, NSPasteboardItem, NSPasteboardTypePNG, NSPasteboardTypeString,
-    NSPasteboardTypeTIFF, NSPasteboardWriting,
+    NSImage, NSPasteboard, NSPasteboardContentsOptions, NSPasteboardItem,
+    NSPasteboardItemDataProvider, NSPasteboardType, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
+    NSPasteboardTypeString, NSPasteboardTypeTIFF, NSPasteboardWriting,
 };
 use objc2_foundation::{NSArray, NSData, NSString, NSURL};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // AppKit caches pasteboard objects and type conversions inside the process.
 // All access, including lookup and release, shares this boundary. The receipt
@@ -176,9 +178,40 @@ impl NativeClipboard {
         })
     }
 
+    /// Files another computer offered: one item for each, whose file is
+    /// fetched when a paste asks for it.
+    pub fn set_promised_files(&self, placeholder: &Arc<Placeholder>) -> Result<()> {
+        self.with_board(|board| {
+            let providers: Vec<Retained<FileProvider>> = (0..placeholder.count())
+                .map(|index| FileProvider::new(index, placeholder.clone()))
+                .collect();
+            let types = NSArray::from_slice(&[unsafe { NSPasteboardTypeFileURL }]);
+            let mut items = Vec::with_capacity(providers.len());
+            for provider in &providers {
+                let item = NSPasteboardItem::new();
+                ensure!(
+                    item.setDataProvider_forTypes(ProtocolObject::from_ref(&**provider), &types),
+                    "cannot prepare offered files"
+                );
+                items.push(ProtocolObject::from_retained(item));
+            }
+            // Universal Clipboard would otherwise read the new contents at
+            // once, fetching every offered file. This also clears the board.
+            board.prepareForNewContentsWithOptions(NSPasteboardContentsOptions::CurrentHostOnly);
+            ensure!(
+                board.writeObjects(&NSArray::from_retained_slice(&items)),
+                "clipboard write failed"
+            );
+            // Items don't keep their providers alive.
+            *PROVIDERS.lock().unwrap() = Providers(providers);
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
     pub fn set_files(&self, paths: &[String]) -> Result<()> {
         if paths.is_empty() {
-            bail!("empty clipboard file list");
+            anyhow::bail!("empty clipboard file list");
         }
         self.with_board(|board| {
             let mut urls = Vec::with_capacity(paths.len());
@@ -193,6 +226,82 @@ impl NativeClipboard {
             }
             Self::write(board, &urls)
         })
+    }
+}
+
+/// The providers of the offered files on the clipboard, replaced by the
+/// next offer.
+static PROVIDERS: Mutex<Providers> = Mutex::new(Providers(Vec::new()));
+struct Providers(Vec<Retained<FileProvider>>);
+// Retain and release are thread-safe; the providers are only created and
+// replaced inside the native access boundary and called on the main thread.
+unsafe impl Send for Providers {}
+
+struct FileProviderIvars {
+    /// Which of the offered items this provides.
+    index: usize,
+    placeholder: Arc<Placeholder>,
+}
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements, and FileProvider
+    // does not implement Drop.
+    #[unsafe(super(NSObject))]
+    #[name = "SeamOfferedFileProvider"]
+    #[ivars = FileProviderIvars]
+    struct FileProvider;
+
+    unsafe impl NSObjectProtocol for FileProvider {}
+
+    unsafe impl NSPasteboardItemDataProvider for FileProvider {
+        /// A paste asked for this item's file. Runs on the main thread,
+        /// which waits until the offered files have arrived.
+        #[unsafe(method(pasteboard:item:provideDataForType:))]
+        fn provide(
+            &self,
+            _pasteboard: Option<&NSPasteboard>,
+            item: &NSPasteboardItem,
+            kind: &NSPasteboardType,
+        ) {
+            let file_url = unsafe { NSPasteboardTypeFileURL };
+            if !kind.isEqualToString(file_url) {
+                return;
+            }
+            let ivars = self.ivars();
+            let Some(files) = ivars.placeholder.files() else {
+                return;
+            };
+            // Links among the copied items aren't sent, so fewer may arrive.
+            let Some(path) = files.get(ivars.index) else {
+                return;
+            };
+            let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+            if let Some(url) = url.absoluteString() {
+                with_native(|| item.setString_forType(&url, file_url));
+            }
+        }
+
+        /// The clipboard holds something else now, or every file was
+        /// provided: let go of the offer.
+        #[unsafe(method(pasteboardFinishedWithDataProvider:))]
+        fn finished(&self, _pasteboard: &NSPasteboard) {
+            let released = {
+                let mut providers = PROVIDERS.lock().unwrap();
+                let (released, kept) = std::mem::take(&mut providers.0)
+                    .into_iter()
+                    .partition(|provider| std::ptr::eq(&**provider, self));
+                providers.0 = kept;
+                released
+            };
+            drop::<Vec<Retained<FileProvider>>>(released);
+        }
+    }
+);
+
+impl FileProvider {
+    fn new(index: usize, placeholder: Arc<Placeholder>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(FileProviderIvars { index, placeholder });
+        unsafe { msg_send![super(this), init] }
     }
 }
 
