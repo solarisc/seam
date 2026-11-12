@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.2.1
+
+Double-clicking works on a Mac you control from another computer.
+
+### Install
+
+- **Windows 10 or 11:** download `Seam-1.2.1-windows-setup.exe` below and
+  run it; it updates an earlier version in place, keeping your settings and
+  pairings. The setup program isn't signed yet; if SmartScreen appears,
+  choose **More info → Run anyway**. `SHA256SUMS.txt` has its checksum.
+- **macOS 11 or later:** releases don't include the Mac app yet. Build it
+  from source with `scripts/build-macos.sh --install`; see
+  [Build from source](https://github.com/solarisc/seam#build-from-source).
+
+1.2.1 connects to 1.2.0. The fix is for the Mac being controlled, so update
+Seam on that Mac to get it.
+
+### Fixed
+
+- **Double-click on a controlled Mac.** Clicks sent to a Mac were always
+  posted as single clicks, so double-clicking in Finder or any other app
+  did nothing. Seam now counts quick presses of the same button in about
+  the same place, using the double-click speed set on the Mac, so double
+  and triple clicks work as they do with a mouse plugged into the Mac. A
+  press that is too slow, moves too far or uses another button starts a
+  new count.
+
 ## 1.2.0
 
 Copied files are sent when you paste them, and the Screens page keeps every
