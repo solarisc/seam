@@ -16,7 +16,7 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 #[repr(C)]
@@ -40,6 +40,7 @@ const KEY_DOWN: u32 = 10;
 const KEY_UP: u32 = 11;
 const FLAGS_CHANGED: u32 = 12;
 const KEYBOARD_KEYCODE: u32 = 9;
+const MOUSE_CLICK_STATE: u32 = 1;
 const MOUSE_BUTTON_NUMBER: u32 = 3;
 const GESTURE: u32 = 29;
 const TAP_DISABLED_BY_TIMEOUT: u32 = 0xffff_fffe;
@@ -57,6 +58,19 @@ const INJECTED_INPUT_TAG: i64 = 0x5441_4e44_4553_4b01;
 static CURSOR_HIDDEN: Mutex<bool> = Mutex::new(false);
 static BACKGROUND_CURSOR: OnceLock<Result<(), String>> = OnceLock::new();
 static CURSOR_LOCKED: AtomicBool = AtomicBool::new(false);
+static CLICK_RUN: Mutex<Option<ClickRun>> = Mutex::new(None);
+/// How far, in points, the pointer may move between presses that still count
+/// as one double or triple click.
+const CLICK_SLOP: f64 = 4.0;
+
+/// The latest press of a run of clicks on one button.
+#[derive(Clone, Copy)]
+struct ClickRun {
+    button: MouseButton,
+    at: Instant,
+    point: Point,
+    count: i64,
+}
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -502,9 +516,62 @@ pub fn simulate_peer_button(
         unsafe { CFRelease(current) };
         point
     };
+    let count = next_click_count(
+        &mut CLICK_RUN.lock().unwrap(),
+        button,
+        down,
+        point,
+        Instant::now(),
+        double_click_interval(),
+    );
     let event = mouse_event(kind, point, number)?;
+    // A posted event always reports a single click unless told otherwise, so
+    // Finder and every other app would never see a double click.
+    unsafe { CGEventSetIntegerValueField(event, MOUSE_CLICK_STATE, count) };
     unsafe { post_owned_event(event, flags) };
     Ok(())
+}
+
+/// The double-click speed set in the Mac's settings.
+fn double_click_interval() -> Duration {
+    let seconds: f64 = unsafe { objc2::msg_send![objc2::class!(NSEvent), doubleClickInterval] };
+    Duration::try_from_secs_f64(seconds).unwrap_or(Duration::from_millis(500))
+}
+
+/// Count presses of the same button made quickly and close together, as the
+/// Mac does for a real mouse. A release reports the count of its press.
+fn next_click_count(
+    run: &mut Option<ClickRun>,
+    button: MouseButton,
+    down: bool,
+    point: Point,
+    now: Instant,
+    interval: Duration,
+) -> i64 {
+    if !down {
+        return match run {
+            Some(last) if last.button == button => last.count,
+            _ => 1,
+        };
+    }
+    let count = match run {
+        Some(last)
+            if last.button == button
+                && now.duration_since(last.at) <= interval
+                && (point.x - last.point.x).abs() <= CLICK_SLOP
+                && (point.y - last.point.y).abs() <= CLICK_SLOP =>
+        {
+            last.count + 1
+        }
+        _ => 1,
+    };
+    *run = Some(ClickRun {
+        button,
+        at: now,
+        point,
+        count,
+    });
+    count
 }
 
 /// Construct an owned native event only if CoreGraphics preserves its button.
@@ -947,6 +1014,36 @@ pub fn run(
 #[cfg(test)]
 mod mouse_tests {
     use super::*;
+
+    #[test]
+    fn quick_presses_in_one_place_count_as_double_and_triple_clicks() {
+        let interval = Duration::from_millis(500);
+        let start = Instant::now();
+        let here = Point { x: 100.0, y: 100.0 };
+        let mut run = None;
+        let mut press = |button, down, point, ms| {
+            next_click_count(
+                &mut run,
+                button,
+                down,
+                point,
+                start + Duration::from_millis(ms),
+                interval,
+            )
+        };
+        assert_eq!(press(MouseButton::Left, true, here, 0), 1);
+        assert_eq!(press(MouseButton::Left, false, here, 80), 1);
+        assert_eq!(press(MouseButton::Left, true, here, 200), 2);
+        assert_eq!(press(MouseButton::Left, false, here, 260), 2);
+        let nudged = Point { x: 102.0, y: 99.0 };
+        assert_eq!(press(MouseButton::Left, true, nudged, 400), 3);
+        // Too slow, too far, or another button starts a new run.
+        assert_eq!(press(MouseButton::Left, true, nudged, 1000), 1);
+        let far = Point { x: 140.0, y: 100.0 };
+        assert_eq!(press(MouseButton::Left, true, far, 1100), 1);
+        assert_eq!(press(MouseButton::Right, true, far, 1200), 1);
+        assert_eq!(press(MouseButton::Left, false, far, 1250), 1);
+    }
 
     #[test]
     fn native_motion_preserves_absolute_position_and_accumulated_delta() {
